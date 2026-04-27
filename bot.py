@@ -2,6 +2,8 @@ import os
 import json
 import logging
 import io
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from telegram import Update
 from telegram.ext import (
@@ -34,6 +36,15 @@ NAME_KEYWORDS = [
     'item', 'name', '\ud488\ubaa9', '\uc544\uc774\ud15c', '\ubaa8\ub378\uba85', '\ubaa8\ub378', '\uc81c\ud488', '\ud56d\ubaa9'
 ]
 EXCLUDE_PRICE = ['retail', 'msrp', 'recommend', 'consumer', '\uc18c\ube44\uc790', '\ud310\ub9e4\uac00', '\uc18c\ub9e4']
+
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b'OK')
+    def log_message(self, *args):
+        pass
 
 
 def get_creds():
@@ -267,6 +278,9 @@ def main():
             url_path=BOT_TOKEN,
         )
     else:
+        health = HTTPServer(('0.0.0.0', port), HealthHandler)
+        t = threading.Thread(target=health.serve_forever, daemon=True)
+        t.start()
         app.run_polling()
 
 
