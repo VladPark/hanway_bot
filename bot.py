@@ -24,9 +24,16 @@ RATE = 1450
 
 WAITING_SUPPLIER = 1
 
-PRICE_KEYWORDS = ['supply', 'supply price', '공급가', '납품가', '공급']
-NAME_KEYWORDS = ['product name', 'product', '상품명', '상품', 'item']
-EXCLUDE_PRICE = ['retail', 'msrp', 'recommend', 'consumer']
+PRICE_KEYWORDS = [
+    'supply price', 'supply', '\uacf5\uae09\uac00', '\ub0a9\ud488\uac00', '\uacf5\uae09\ub2e8\uac00', '\uacf5\uae09\uac00\uaca9',
+    '\ub2e8\uac00', '\uc6d0\uac00', '\ub3c4\ub9e4\uac00', '\ub3c4\ub9e4\ub2e8\uac00', 'wholesale', 'cost', 'unit price',
+    '\uac00\uaca9', '\uacf5\uae09', '\ub9e4\uc785\uac00', '\ub9e4\uc785\ub2e8\uac00', '\uc6d0\ub2e8\uac00', 'price'
+]
+NAME_KEYWORDS = [
+    'product name', 'product', '\uc0c1\ud488\uba85', '\ud488\uba85', '\uc81c\ud488\uba85', '\uc0c1\ud488',
+    'item', 'name', '\ud488\ubaa9', '\uc544\uc774\ud15c', '\ubaa8\ub378\uba85', '\ubaa8\ub378', '\uc81c\ud488', '\ud56d\ubaa9'
+]
+EXCLUDE_PRICE = ['retail', 'msrp', 'recommend', 'consumer', '\uc18c\ube44\uc790', '\ud310\ub9e4\uac00', '\uc18c\ub9e4']
 
 
 def get_creds():
@@ -39,10 +46,10 @@ def get_creds():
     return Credentials.from_service_account_info(creds_dict, scopes=scopes)
 
 
-def find_columns(headers):
+def find_columns(headers, ws=None):
     product_col = -1
     price_col = -1
-    h_lower = [str(h).lower().strip() for h in headers]
+    h_lower = [str(h).lower().strip() if h else '' for h in headers]
 
     for i, h in enumerate(h_lower):
         for kw in NAME_KEYWORDS:
@@ -56,6 +63,33 @@ def find_columns(headers):
         if has_price and not has_exclude:
             price_col = i
             break
+
+    if ws and (product_col == -1 or price_col == -1):
+        numeric_scores = [0] * len(headers)
+        text_scores = [0] * len(headers)
+        for row in ws.iter_rows(min_row=2, max_row=min(10, ws.max_row), values_only=True):
+            for ci, val in enumerate(row):
+                if ci >= len(headers):
+                    break
+                if val is None:
+                    continue
+                s = str(val).replace(',', '').replace(' ', '').replace('\uc6d0', '')
+                try:
+                    float(s)
+                    numeric_scores[ci] += 1
+                except ValueError:
+                    if len(str(val).strip()) > 1:
+                        text_scores[ci] += 1
+
+        if price_col == -1:
+            best = max(range(len(numeric_scores)), key=lambda i: numeric_scores[i])
+            if numeric_scores[best] > 0:
+                price_col = best
+
+        if product_col == -1:
+            best = max(range(len(text_scores)), key=lambda i: text_scores[i])
+            if text_scores[best] > 0 and best != price_col:
+                product_col = best
 
     return product_col, price_col
 
@@ -118,35 +152,34 @@ def save_to_drive(file_bytes, file_name, supplier):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        '👋 Привет! Я помогу отслеживать цены поставщиков.\n\n'
-        'Просто кидай Excel файл — я спрошу поставщика и добавлю всё в базу.'
+        '\U0001f44b \u041f\u0440\u0438\u0432\u0435\u0442! \u042f \u043f\u043e\u043c\u043e\u0433\u0443 \u043e\u0442\u0441\u043b\u0435\u0436\u0438\u0432\u0430\u0442\u044c \u0446\u0435\u043d\u044b \u043f\u043e\u0441\u0442\u0430\u0432\u0449\u0438\u043a\u043e\u0432.\n\n'
+        '\u041f\u0440\u043e\u0441\u0442\u043e \u043a\u0438\u0434\u0430\u0439 Excel \u0444\u0430\u0439\u043b \u2014 \u044f \u0441\u043f\u0440\u043e\u0448\u0443 \u043f\u043e\u0441\u0442\u0430\u0432\u0449\u0438\u043a\u0430 \u0438 \u0434\u043e\u0431\u0430\u0432\u043b\u044e \u0432\u0441\u0451 \u0432 \u0431\u0430\u0437\u0443.'
     )
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc = update.message.document
     if not doc.file_name.lower().endswith(('.xlsx', '.xls')):
-        await update.message.reply_text('❌ Нужен Excel файл (.xlsx)')
+        await update.message.reply_text('\u274c \u041d\u0443\u0436\u0435\u043d Excel \u0444\u0430\u0439\u043b (.xlsx)')
         return ConversationHandler.END
 
     context.user_data['file_id'] = doc.file_id
     context.user_data['file_name'] = doc.file_name
 
-    # Check if supplier was sent as caption
     caption = update.message.caption
     if caption and caption.strip():
         context.user_data['supplier'] = caption.strip()
-        await update.message.reply_text(f'⏳ Обрабатываю файл от {caption.strip()}...')
+        await update.message.reply_text(f'\u23f3 \u041e\u0431\u0440\u0430\u0431\u0430\u0442\u044b\u0432\u0430\u044e \u0444\u0430\u0439\u043b \u043e\u0442 {caption.strip()}...')
         return await process_file(update, context)
 
-    await update.message.reply_text('🏢 Кто поставщик?')
+    await update.message.reply_text('\U0001f3e2 \u041a\u0442\u043e \u043f\u043e\u0441\u0442\u0430\u0432\u0449\u0438\u043a?')
     return WAITING_SUPPLIER
 
 
 async def handle_supplier_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     supplier = update.message.text.strip()
     context.user_data['supplier'] = supplier
-    await update.message.reply_text(f'⏳ Обрабатываю файл от {supplier}...')
+    await update.message.reply_text(f'\u23f3 \u041e\u0431\u0440\u0430\u0431\u0430\u0442\u044b\u0432\u0430\u044e \u0444\u0430\u0439\u043b \u043e\u0442 {supplier}...')
     return await process_file(update, context)
 
 
@@ -162,14 +195,14 @@ async def process_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         wb = openpyxl.load_workbook(io.BytesIO(file_bytes))
         ws = wb.active
         headers = [cell.value for cell in ws[1]]
-        product_col, price_col = find_columns(headers)
+        product_col, price_col = find_columns(headers, ws)
 
         if product_col == -1 or price_col == -1:
             cols = ', '.join([str(h) for h in headers[:15] if h])
             await update.message.reply_text(
-                f'❌ Не нашёл столбцы товара или цены.\n'
-                f'Столбцы в файле: {cols}\n\n'
-                f'Напиши какой столбец цена и какой название.'
+                f'\u274c \u041d\u0435 \u043d\u0430\u0448\u0451\u043b \u0441\u0442\u043e\u043b\u0431\u0446\u044b \u0442\u043e\u0432\u0430\u0440\u0430 \u0438\u043b\u0438 \u0446\u0435\u043d\u044b.\n'
+                f'\u0421\u0442\u043e\u043b\u0431\u0446\u044b \u0432 \u0444\u0430\u0439\u043b\u0435: {cols}\n\n'
+                f'\u041d\u0430\u043f\u0438\u0448\u0438 \u043a\u0430\u043a\u043e\u0439 \u0441\u0442\u043e\u043b\u0431\u0435\u0446 \u0446\u0435\u043d\u0430 \u0438 \u043a\u0430\u043a\u043e\u0439 \u043d\u0430\u0437\u0432\u0430\u043d\u0438\u0435.'
             )
             context.user_data.clear()
             return ConversationHandler.END
@@ -185,7 +218,7 @@ async def process_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 data_rows.append((product, price_krw))
 
         if not data_rows:
-            await update.message.reply_text('❌ Не нашёл данных в файле.')
+            await update.message.reply_text('\u274c \u041d\u0435 \u043d\u0430\u0448\u0451\u043b \u0434\u0430\u043d\u043d\u044b\u0445 \u0432 \u0444\u0430\u0439\u043b\u0435.')
             context.user_data.clear()
             return ConversationHandler.END
 
@@ -194,16 +227,16 @@ async def process_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_to_drive(bytes(file_bytes), file_name, supplier)
 
         await update.message.reply_text(
-            f'✅ Готово!\n\n'
-            f'📦 Поставщик: {supplier}\n'
-            f'➕ Добавлено: {added} товаров\n'
-            f'🔄 Обновлено: {updated_count} товаров\n'
-            f'📁 Файл сохранён в Drive → папка {supplier}'
+            f'\u2705 \u0413\u043e\u0442\u043e\u0432\u043e!\n\n'
+            f'\U0001f4e6 \u041f\u043e\u0441\u0442\u0430\u0432\u0449\u0438\u043a: {supplier}\n'
+            f'\u2795 \u0414\u043e\u0431\u0430\u0432\u043b\u0435\u043d\u043e: {added} \u0442\u043e\u0432\u0430\u0440\u043e\u0432\n'
+            f'\U0001f504 \u041e\u0431\u043d\u043e\u0432\u043b\u0435\u043d\u043e: {updated_count} \u0442\u043e\u0432\u0430\u0440\u043e\u0432\n'
+            f'\U0001f4c1 \u0424\u0430\u0439\u043b \u0441\u043e\u0445\u0440\u0430\u043d\u0451\u043d \u0432 Drive \u2192 \u043f\u0430\u043f\u043a\u0430 {supplier}'
         )
 
     except Exception as e:
         logger.error(e, exc_info=True)
-        await update.message.reply_text(f'❌ Ошибка: {str(e)}')
+        await update.message.reply_text(f'\u274c \u041e\u0448\u0438\u0431\u043a\u0430: {str(e)}')
 
     context.user_data.clear()
     return ConversationHandler.END
