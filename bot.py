@@ -146,9 +146,21 @@ def find_columns(headers, sample_rows=None):
     return product_col, price_col
 
 
+def get_gspread_client():
+    raw = os.environ['GOOGLE_CREDENTIALS']
+    try:
+        creds_dict = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        creds_dict = json.loads(base64.b64decode(raw).decode('utf-8'))
+    scopes = [
+        'https://www.googleapis.com/auth/spreadsheets',
+        'https://www.googleapis.com/auth/drive'
+    ]
+    return gspread.service_account_from_dict(creds_dict, scopes=scopes)
+
+
 def update_sheet(data_rows, supplier, date_str):
-    creds = get_creds()
-    gc = gspread.authorize(creds)
+    gc = get_gspread_client()
     sheet = gc.open_by_key(SHEET_ID).sheet1
 
     existing = sheet.get_all_values()
@@ -176,7 +188,7 @@ def update_sheet(data_rows, supplier, date_str):
 
 
 def save_to_drive(file_bytes, file_name, supplier):
-    creds = get_creds()
+    creds = get_creds()  # google-auth creds for Drive API
     drive = build('drive', 'v3', credentials=creds)
 
     query = f"name='{supplier}' and '{DRIVE_FOLDER_ID}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
@@ -288,7 +300,7 @@ async def process_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f'✅ Готово!\n\n'
             f'📦 Поставщик: {supplier}\n'
             f'➕ Добавлено: {added} товаров\n'
-            f'🔄 Обновленп: {updated_count} товаров\n'
+            f'🔄 Обновлено: {updated_count} товаров\n'
             f'📁 Файл сохранён в Drive → папка {supplier}'
         )
 
