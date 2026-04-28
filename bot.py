@@ -16,6 +16,7 @@ from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 import openpyxl
+import xlrd
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -61,7 +62,39 @@ def get_creds():
     return Credentials.from_service_account_info(creds_dict, scopes=scopes)
 
 
-def find_columns(headers, ws=None, header_row=1):
+def read_excel(file_bytes, file_name):
+    ext = file_name.lower().rsplit('.', 1)[-1]
+
+    if ext == 'xls':
+        wb = xlrd.open_workbook(file_contents=bytes(file_bytes))
+        best = max(range(wb.nsheets), key=lambda i: wb.sheet_by_index(i).nrows * wb.sheet_by_index(i).ncols)
+        ws = wb.sheet_by_index(best)
+        all_rows = [[ws.cell_value(r, c) for c in range(ws.ncols)] for r in range(ws.nrows)]
+    else:
+        wb = openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
+        best_ws = wb.active
+        for sheet in wb.worksheets:
+            if sheet.max_row and sheet.max_column:
+                if not best_ws.max_row or (sheet.max_row * sheet.max_column > best_ws.max_row * best_ws.max_column):
+                    best_ws = sheet
+        all_rows = [list(row) for row in best_ws.iter_rows(values_only=True)]
+        wb.close()
+
+    if not all_rows:
+        return [], []
+
+    header_idx = 0
+    for i, row in enumerate(all_rows[:15]):
+        if sum(1 for v in row if v is not None and str(v).strip()) >= 3:
+            header_idx = i
+            break
+
+    headers = all_rows[header_idx]
+    data = all_rows[header_idx + 1:]
+    return headers, data
+
+
+def find_columns(headers, sample_rows=None):
     product_col = -1
     price_col = -1
     h_lower = [str(h).lower().strip() if h else '' for h in headers]
@@ -79,14 +112,12 @@ def find_columns(headers, ws=None, header_row=1):
             price_col = i
             break
 
-    if ws and (product_col == -1 or price_col == -1):
+    if sample_rows and (product_col == -1 or price_col == -1):
         numeric_scores = [0] * len(headers)
         text_scores = [0] * len(headers)
-        for row in ws.iter_rows(min_row=header_row + 1, max_row=min(header_row + 10, ws.max_row), values_only=True):
+        for row in sample_rows[:10]:
             for ci, val in enumerate(row):
-                if ci >= len(headers):
-                    break
-                if val is None:
+                if ci >= len(headers) or val is None:
                     continue
                 s = str(val).replace(',', '').replace(' ', '').replace('\uc6d0', '')
                 try:
@@ -175,7 +206,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc = update.message.document
     if not doc.file_name.lower().endswith(('.xlsx', '.xls')):
-        await update.message.reply_text('\u274c \u041d\u0443\u0436\u0435\u043d Excel \u0444\u0430\u0439\u043b (.xlsx)')
+        await update.message.reply_text('\u274c \u041d\u0443\u0436\u0435\u043d Excel \u0444\u0430\u0439\u043b (.xlsx \u0438\u043b\u0438 .xls)')
         return ConversationHandler.END
 
     context.user_data['file_id'] = doc.file_id
@@ -207,27 +238,14 @@ async def process_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file = await context.bot.get_file(file_id)
         file_bytes = await file.download_as_bytearray()
 
-        wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
+        headers, all_data = read_excel(file_bytes, file_name)
 
-        best_ws = wb.active
-        best_count = 0
-        for sheet in wb.worksheets:
-            count = sum(1 for row in sheet.iter_rows(values_only=True) for c in row if c is not None)
-            if count > best_count:
-                best_count = count
-                best_ws = sheet
-        ws = best_ws
+        if not headers:
+            await update.message.reply_text('\u274c \u0424\u0430\u0439\u043b \u043f\u0443\u0441\u0442\u043e\u0439 \u0438\u043b\u0438 \u043d\u0435 \u0447\u0438\u0442\u0430\u0435\u0442\u0441\u044f.')
+            context.user_data.clear()
+            return ConversationHandler.END
 
-        header_row = 1
-        for ri in range(1, min(10, ws.max_row + 1)):
-            row_vals = [ws.cell(ri, ci).value for ci in range(1, ws.max_column + 1)]
-            non_empty = sum(1 for v in row_vals if v is not None and str(v).strip())
-            if non_empty >= 3:
-                header_row = ri
-                break
-
-        headers = [ws.cell(header_row, ci).value for ci in range(1, ws.max_column + 1)]
-        product_col, price_col = find_columns(headers, ws, header_row)
+        product_col, price_col = find_columns(headers, all_data)
 
         if product_col == -1 or price_col == -1:
             cols = ', '.join([str(h) for h in headers[:20] if h])
@@ -240,7 +258,9 @@ async def process_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return ConversationHandler.END
 
         data_rows = []
-        for row in ws.iter_rows(min_row=header_row + 1, values_only=True):
+        for row in all_data:
+            if len(row) <= max(product_col, price_col):
+                continue
             product = str(row[product_col] or '').strip()
             try:
                 price_krw = int(float(str(row[price_col] or 0).replace(',', '').replace(' ', '')))
@@ -268,7 +288,8 @@ async def process_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logger.error(e, exc_info=True)
-        await update.message.reply_text(f'\u274c \u041e\u0448\u0438\u0431\u043a\u0430: {str(e)}')
+        err = str(e) if str(e) else type(e).__name__
+        await update.message.reply_text(f'\u274c \u041e\u0448\u0438\u0431\u043a\u0430: {err}')
 
     context.user_data.clear()
     return ConversationHandler.END
