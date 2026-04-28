@@ -140,7 +140,7 @@ def find_columns(headers, sample_rows=None):
 
         if product_col == -1:
             best = max(range(len(text_scores)), key=lambda i: text_scores[i])
-            if text_scores[best] > 0 and best != price_col:
+            if text_Scores[best] > 0 and best != price_col:
                 product_col = best
 
     return product_col, price_col
@@ -168,21 +168,31 @@ def update_sheet(data_rows, supplier, date_str):
         sheet.insert_row(['Product', 'Supplier', 'Price KRW', 'Price USD', 'Updated'], 1)
         existing = sheet.get_all_values()
 
+    # Build lookup for O(1) access instead of O(n) per product
+    existing_lookup = {}
+    for j, row in enumerate(existing[1:], 2):
+        if len(row) >= 2:
+            existing_lookup[(row[0], row[1])] = j
+
+    batch_updates = []
+    new_rows = []
     added = 0
     updated = 0
 
     for product, price_krw in data_rows:
         price_usd = round(price_krw / RATE, 2)
-        found = False
-        for j, row in enumerate(existing[1:], 2):
-            if len(row) >= 2 and row[0] == product and row[1] == supplier:
-                sheet.update(f'C{j}:E{j}', [[price_krw, price_usd, date_str]])
-                updated += 1
-                found = True
-                break
-        if not found:
-            sheet.append_row([product, supplier, price_krw, price_usd, date_str])
+        j = existing_lookup.get((product, supplier))
+        if j:
+            batch_updates.append({'range': f'C{j}:E{j}', 'values': [[price_krw, price_usd, date_str]]})
+            updated += 1
+        else:
+            new_rows.append([product, supplier, price_krw, price_usd, date_str])
             added += 1
+
+    if batch_updates:
+        sheet.batch_update(batch_updates)
+    if new_rows:
+        sheet.append_rows(new_rows, value_input_option='RAW')
 
     return added, updated
 
@@ -216,7 +226,7 @@ def save_to_drive(file_bytes, file_name, supplier):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        '👋 Привет! Я помогу отслеживать цены поставщиков.\n\n'
+        '👋 Привет! Я помогу отслеживать цены поставщико�v.\n\n'
         'Просто кидай Excel файл — я спрошу поставщика и добавлю всё в базу.'
     )
 
