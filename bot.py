@@ -29,15 +29,15 @@ RATE = 1450
 WAITING_SUPPLIER = 1
 
 PRICE_KEYWORDS = [
-    'supply price', 'supply', '\uacf5\uae09\uac00', '\ub0a9\ud488\uac00', '\uacf5\uae09\ub2e8\uac00', '\uacf5\uae09\uac00\uaca9',
-    '\ub2e8\uac00', '\uc6d0\uac00', '\ub3c4\ub9e4\uac00', '\ub3c4\ub9e4\ub2e8\uac00', 'wholesale', 'cost', 'unit price',
-    '\uac00\uaca9', '\uacf5\uae09', '\ub9e4\uc785\uac00', '\ub9e4\uc785\ub2e8\uac00', '\uc6d0\ub2e8\uac00', 'price'
+    'supply price', 'supply', '공급가', '납품가', '공급단가', '공급가격',
+    '단가', '원가', '도매가', '도매단가', 'wholesale', 'cost', 'unit price',
+    '가격', '공급', '매입가', '매입단가', '원단가', 'price'
 ]
 NAME_KEYWORDS = [
-    'product name', 'product', '\uc0c1\ud488\uba85', '\ud488\uba85', '\uc81c\ud488\uba85', '\uc0c1\ud488',
-    'item', 'name', '\ud488\ubaa9', '\uc544\uc774\ud15c', '\ubaa8\ub378\uba85', '\ubaa8\ub378', '\uc81c\ud488', '\ud56d\ubaa9'
+    'product name', 'product', '상품명', '품명', '제품명', '상품',
+    'item', 'name', '품목', '아이템', '모델명', '모델', '제품', '항목'
 ]
-EXCLUDE_PRICE = ['retail', 'msrp', 'recommend', 'consumer', '\uc18c\ube44\uc790', '\ud310\ub9e4\uac00', '\uc18c\ub9e4']
+EXCLUDE_PRICE = ['retail', 'msrp', 'recommend', 'consumer', '소비자', '판매가', '소매']
 
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -63,15 +63,19 @@ def get_creds():
 
 
 def read_excel(file_bytes, file_name):
+    """Returns (headers list, all_data list of lists). Supports .xlsx and .xls."""
     ext = file_name.lower().rsplit('.', 1)[-1]
 
     if ext == 'xls':
         wb = xlrd.open_workbook(file_contents=bytes(file_bytes))
+        # Pick sheet with most cells
         best = max(range(wb.nsheets), key=lambda i: wb.sheet_by_index(i).nrows * wb.sheet_by_index(i).ncols)
         ws = wb.sheet_by_index(best)
         all_rows = [[ws.cell_value(r, c) for c in range(ws.ncols)] for r in range(ws.nrows)]
     else:
+        # read_only=True streams row by row — works on large files
         wb = openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
+        # Pick sheet with largest declared dimensions
         best_ws = wb.active
         for sheet in wb.worksheets:
             if sheet.max_row and sheet.max_column:
@@ -83,6 +87,7 @@ def read_excel(file_bytes, file_name):
     if not all_rows:
         return [], []
 
+    # Find header row: first row with 3+ non-empty cells
     header_idx = 0
     for i, row in enumerate(all_rows[:15]):
         if sum(1 for v in row if v is not None and str(v).strip()) >= 3:
@@ -112,6 +117,7 @@ def find_columns(headers, sample_rows=None):
             price_col = i
             break
 
+    # Fallback: scan first 10 data rows
     if sample_rows and (product_col == -1 or price_col == -1):
         numeric_scores = [0] * len(headers)
         text_scores = [0] * len(headers)
@@ -119,7 +125,7 @@ def find_columns(headers, sample_rows=None):
             for ci, val in enumerate(row):
                 if ci >= len(headers) or val is None:
                     continue
-                s = str(val).replace(',', '').replace(' ', '').replace('\uc6d0', '')
+                s = str(val).replace(',', '').replace(' ', '').replace('원', '')
                 try:
                     float(s)
                     numeric_scores[ci] += 1
@@ -198,15 +204,15 @@ def save_to_drive(file_bytes, file_name, supplier):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        '\U0001f44b \u041f\u0440\u0438\u0432\u0435\u0442! \u042f \u043f\u043e\u043c\u043e\u0433\u0443 \u043e\u0442\u0441\u043b\u0435\u0436\u0438\u0432\u0430\u0442\u044c \u0446\u0435\u043d\u044b \u043f\u043e\u0441\u0442\u0430\u0432\u0449\u0438\u043a\u043e\u0432.\n\n'
-        '\u041f\u0440\u043e\u0441\u0442\u043e \u043a\u0438\u0434\u0430\u0439 Excel \u0444\u0430\u0439\u043b \u2014 \u044f \u0441\u043f\u0440\u043e\u0448\u0443 \u043f\u043e\u0441\u0442\u0430\u0432\u0449\u0438\u043a\u0430 \u0438 \u0434\u043e\u0431\u0430\u0432\u043b\u044e \u0432\u0441\u0451 \u0432 \u0431\u0430\u0437\u0443.'
+        '👋 Привет! Я помогу отслеживать цены поставщиков.\n\n'
+        'Просто кидай Excel файл — я спрошу поставщика и добавлю всё в базу.'
     )
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc = update.message.document
     if not doc.file_name.lower().endswith(('.xlsx', '.xls')):
-        await update.message.reply_text('\u274c \u041d\u0443\u0436\u0435\u043d Excel \u0444\u0430\u0439\u043b (.xlsx \u0438\u043b\u0438 .xls)')
+        await update.message.reply_text('❌ Нужен Excel файл (.xlsx или .xls)')
         return ConversationHandler.END
 
     context.user_data['file_id'] = doc.file_id
@@ -215,17 +221,17 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caption = update.message.caption
     if caption and caption.strip():
         context.user_data['supplier'] = caption.strip()
-        await update.message.reply_text(f'\u23f3 \u041e\u0431\u0440\u0430\u0431\u0430\u0442\u044b\u0432\u0430\u044e \u0444\u0430\u0439\u043b \u043e\u0442 {caption.strip()}...')
+        await update.message.reply_text(f'⏳ Обрабатываю файл от {caption.strip()}...')
         return await process_file(update, context)
 
-    await update.message.reply_text('\U0001f3e2 \u041a\u0442\u043e \u043f\u043e\u0441\u0442\u0430\u0432\u0449\u0438\u043a?')
+    await update.message.reply_text('🏢 Кто поставщик?')
     return WAITING_SUPPLIER
 
 
 async def handle_supplier_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     supplier = update.message.text.strip()
     context.user_data['supplier'] = supplier
-    await update.message.reply_text(f'\u23f3 \u041e\u0431\u0440\u0430\u0431\u0430\u0442\u044b\u0432\u0430\u044e \u0444\u0430\u0439\u043b \u043e\u0442 {supplier}...')
+    await update.message.reply_text(f'⏳ Обрабатываю файл от {supplier}...')
     return await process_file(update, context)
 
 
@@ -241,7 +247,7 @@ async def process_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         headers, all_data = read_excel(file_bytes, file_name)
 
         if not headers:
-            await update.message.reply_text('\u274c \u0424\u0430\u0439\u043b \u043f\u0443\u0441\u0442\u043e\u0439 \u0438\u043b\u0438 \u043d\u0435 \u0447\u0438\u0442\u0430\u0435\u0442\u0441\u044f.')
+            await update.message.reply_text('❌ Файл пустой или не читается.')
             context.user_data.clear()
             return ConversationHandler.END
 
@@ -250,9 +256,9 @@ async def process_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if product_col == -1 or price_col == -1:
             cols = ', '.join([str(h) for h in headers[:20] if h])
             await update.message.reply_text(
-                f'\u274c \u041d\u0435 \u043d\u0430\u0448\u0451\u043b \u0441\u0442\u043e\u043b\u0431\u0446\u044b \u0442\u043e\u0432\u0430\u0440\u0430 \u0438\u043b\u0438 \u0446\u0435\u043d\u044b.\n'
-                f'\u0421\u0442\u043e\u043b\u0431\u0446\u044b \u0432 \u0444\u0430\u0439\u043b\u0435: {cols}\n\n'
-                f'\u041d\u0430\u043f\u0438\u0448\u0438 \u043a\u0430\u043a\u043e\u0439 \u0441\u0442\u043e\u043b\u0431\u0435\u0446 \u0446\u0435\u043d\u0430 \u0438 \u043a\u0430\u043a\u043e\u0439 \u043d\u0430\u0437\u0432\u0430\u043d\u0438\u0435.'
+                f'❌ Не нашёл столбцы товара или цены.\n'
+                f'Столбцы в файле: {cols}\n\n'
+                f'Напиши какой столбец цена и какой название.'
             )
             context.user_data.clear()
             return ConversationHandler.END
@@ -270,7 +276,7 @@ async def process_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 data_rows.append((product, price_krw))
 
         if not data_rows:
-            await update.message.reply_text('\u274c \u041d\u0435 \u043d\u0430\u0448\u0451\u043b \u0434\u0430\u043d\u043d\u044b\u0445 \u0432 \u0444\u0430\u0439\u043b\u0435.')
+            await update.message.reply_text('❌ Не нашёл данных в файле.')
             context.user_data.clear()
             return ConversationHandler.END
 
@@ -279,17 +285,19 @@ async def process_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_to_drive(bytes(file_bytes), file_name, supplier)
 
         await update.message.reply_text(
-            f'\u2705 \u0413\u043e\u0442\u043e\u0432\u043e!\n\n'
-            f'\U0001f4e6 \u041f\u043e\u0441\u0442\u0430\u0432\u0449\u0438\u043a: {supplier}\n'
-            f'\u2795 \u0414\u043e\u0431\u0430\u0432\u043b\u0435\u043d\u043e: {added} \u0442\u043e\u0432\u0430\u0440\u043e\u0432\n'
-            f'\U0001f504 \u041e\u0431\u043d\u043e\u0432\u043b\u0435\u043d\u043e: {updated_count} \u0442\u043e\u0432\u0430\u0440\u043e\u0432\n'
-            f'\U0001f4c1 \u0424\u0430\u0439\u043b \u0441\u043e\u0445\u0440\u0430\u043d\u0451\u043d \u0432 Drive \u2192 \u043f\u0430\u043f\u043a\u0430 {supplier}'
+            f'✅ Готово!\n\n'
+            f'📦 Поставщик: {supplier}\n'
+            f'➕ Добавлено: {added} товаров\n'
+            f'🔄 Обновленп: {updated_count} товаров\n'
+            f'📁 Файл сохранён в Drive → папка {supplier}'
         )
 
     except Exception as e:
         logger.error(e, exc_info=True)
         err = str(e) if str(e) else type(e).__name__
-        await update.message.reply_text(f'\u274c \u041e\u0448\u0438\u0431\u043a\u0430: {err}')
+        if not str(e) and e.__cause__:
+            err = f"{type(e).__name__}: {str(e.__cause__)[:300]}"
+        await update.message.reply_text(f'❌ Ошибка: {err}')
 
     context.user_data.clear()
     return ConversationHandler.END
