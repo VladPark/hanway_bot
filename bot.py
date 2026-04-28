@@ -57,7 +57,7 @@ def get_creds():
     return Credentials.from_service_account_info(creds_dict, scopes=scopes)
 
 
-def find_columns(headers, ws=None):
+def find_columns(headers, ws=None, header_row=1):
     product_col = -1
     price_col = -1
     h_lower = [str(h).lower().strip() if h else '' for h in headers]
@@ -78,7 +78,7 @@ def find_columns(headers, ws=None):
     if ws and (product_col == -1 or price_col == -1):
         numeric_scores = [0] * len(headers)
         text_scores = [0] * len(headers)
-        for row in ws.iter_rows(min_row=2, max_row=min(10, ws.max_row), values_only=True):
+        for row in ws.iter_rows(min_row=header_row + 1, max_row=min(header_row + 10, ws.max_row), values_only=True):
             for ci, val in enumerate(row):
                 if ci >= len(headers):
                     break
@@ -203,13 +203,30 @@ async def process_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file = await context.bot.get_file(file_id)
         file_bytes = await file.download_as_bytearray()
 
-        wb = openpyxl.load_workbook(io.BytesIO(file_bytes))
-        ws = wb.active
-        headers = [cell.value for cell in ws[1]]
-        product_col, price_col = find_columns(headers, ws)
+        wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
+
+        best_ws = wb.active
+        best_count = 0
+        for sheet in wb.worksheets:
+            count = sum(1 for row in sheet.iter_rows(values_only=True) for c in row if c is not None)
+            if count > best_count:
+                best_count = count
+                best_ws = sheet
+        ws = best_ws
+
+        header_row = 1
+        for ri in range(1, min(10, ws.max_row + 1)):
+            row_vals = [ws.cell(ri, ci).value for ci in range(1, ws.max_column + 1)]
+            non_empty = sum(1 for v in row_vals if v is not None and str(v).strip())
+            if non_empty >= 3:
+                header_row = ri
+                break
+
+        headers = [ws.cell(header_row, ci).value for ci in range(1, ws.max_column + 1)]
+        product_col, price_col = find_columns(headers, ws, header_row)
 
         if product_col == -1 or price_col == -1:
-            cols = ', '.join([str(h) for h in headers[:15] if h])
+            cols = ', '.join([str(h) for h in headers[:20] if h])
             await update.message.reply_text(
                 f'\u274c \u041d\u0435 \u043d\u0430\u0448\u0451\u043b \u0441\u0442\u043e\u043b\u0431\u0446\u044b \u0442\u043e\u0432\u0430\u0440\u0430 \u0438\u043b\u0438 \u0446\u0435\u043d\u044b.\n'
                 f'\u0421\u0442\u043e\u043b\u0431\u0446\u044b \u0432 \u0444\u0430\u0439\u043b\u0435: {cols}\n\n'
@@ -219,7 +236,7 @@ async def process_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return ConversationHandler.END
 
         data_rows = []
-        for row in ws.iter_rows(min_row=2, values_only=True):
+        for row in ws.iter_rows(min_row=header_row + 1, values_only=True):
             product = str(row[product_col] or '').strip()
             try:
                 price_krw = int(float(str(row[price_col] or 0).replace(',', '').replace(' ', '')))
