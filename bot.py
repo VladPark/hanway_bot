@@ -2,6 +2,7 @@ import os
 import json
 import logging
 import io
+import base64
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -48,8 +49,11 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 
 def get_creds():
-    creds_json = os.environ['GOOGLE_CREDENTIALS']
-    creds_dict = json.loads(creds_json)
+    raw = os.environ['GOOGLE_CREDENTIALS']
+    try:
+        creds_dict = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        creds_dict = json.loads(base64.b64decode(raw).decode('utf-8'))
     scopes = [
         'https://www.googleapis.com/auth/spreadsheets',
         'https://www.googleapis.com/auth/drive'
