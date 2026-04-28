@@ -140,7 +140,7 @@ def find_columns(headers, sample_rows=None):
 
         if product_col == -1:
             best = max(range(len(text_scores)), key=lambda i: text_scores[i])
-            if text_Scores[best] > 0 and best != price_col:
+            if text_scores[best] > 0 and best != price_col:
                 product_col = best
 
     return product_col, price_col
@@ -226,7 +226,7 @@ def save_to_drive(file_bytes, file_name, supplier):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        '👋 Привет! Я помогу отслеживать цены поставщико�v.\n\n'
+        '👋 Привет! Я помогу отслеживать цены поставщиков.\n\n'
         'Просто кидай Excel файл — я спрошу поставщика и добавлю всё в базу.'
     )
 
@@ -304,14 +304,21 @@ async def process_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         date_str = str(update.message.date.strftime('%Y-%m-%d'))
         added, updated_count = update_sheet(data_rows, supplier, date_str)
-        save_to_drive(bytes(file_bytes), file_name, supplier)
+
+        drive_note = ''
+        try:
+            save_to_drive(bytes(file_bytes), file_name, supplier)
+            drive_note = f'\n📁 Файл сохранён в Drive → папка {supplier}'
+        except Exception as drive_err:
+            logger.warning(f'Drive upload failed: {drive_err}')
+            drive_note = '\n⚠️ Drive: не удалось сохранить файл (нет квоты у сервисного аккаунта)'
 
         await update.message.reply_text(
             f'✅ Готово!\n\n'
             f'📦 Поставщик: {supplier}\n'
             f'➕ Добавлено: {added} товаров\n'
-            f'🔄 Обновлено: {updated_count} товаров\n'
-            f'📁 Файл сохранён в Drive → папка {supplier}'
+            f'🔄 Обновлено: {updated_count} товаров'
+            f'{drive_note}'
         )
 
     except Exception as e:
