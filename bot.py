@@ -12,9 +12,6 @@ from telegram.ext import (
     filters, ConversationHandler, ContextTypes
 )
 import gspread
-from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
 import openpyxl
 import xlrd
 
@@ -23,7 +20,6 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ['BOT_TOKEN']
 SHEET_ID = os.environ['SHEET_ID']
-DRIVE_FOLDER_ID = os.environ['DRIVE_FOLDER_ID']
 RATE = 1450
 
 WAITING_SUPPLIER = 1
@@ -45,11 +41,12 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b'OK')
+
     def log_message(self, *args):
         pass
 
 
-def get_creds():
+def get_gspread_client():
     raw = os.environ['GOOGLE_CREDENTIALS']
     try:
         creds_dict = json.loads(raw)
@@ -59,23 +56,19 @@ def get_creds():
         'https://www.googleapis.com/auth/spreadsheets',
         'https://www.googleapis.com/auth/drive'
     ]
-    return Credentials.from_service_account_info(creds_dict, scopes=scopes)
+    return gspread.service_account_from_dict(creds_dict, scopes=scopes)
 
 
 def read_excel(file_bytes, file_name):
-    """Returns (headers list, all_data list of lists). Supports .xlsx and .xls."""
     ext = file_name.lower().rsplit('.', 1)[-1]
 
     if ext == 'xls':
         wb = xlrd.open_workbook(file_contents=bytes(file_bytes))
-        # Pick sheet with most cells
         best = max(range(wb.nsheets), key=lambda i: wb.sheet_by_index(i).nrows * wb.sheet_by_index(i).ncols)
         ws = wb.sheet_by_index(best)
         all_rows = [[ws.cell_value(r, c) for c in range(ws.ncols)] for r in range(ws.nrows)]
     else:
-        # read_only=True streams row by row — works on large files
         wb = openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
-        # Pick sheet with largest declared dimensions
         best_ws = wb.active
         for sheet in wb.worksheets:
             if sheet.max_row and sheet.max_column:
@@ -87,7 +80,6 @@ def read_excel(file_bytes, file_name):
     if not all_rows:
         return [], []
 
-    # Find header row: first row with 3+ non-empty cells
     header_idx = 0
     for i, row in enumerate(all_rows[:15]):
         if sum(1 for v in row if v is not None and str(v).strip()) >= 3:
@@ -117,7 +109,6 @@ def find_columns(headers, sample_rows=None):
             price_col = i
             break
 
-    # Fallback: scan first 10 data rows
     if sample_rows and (product_col == -1 or price_col == -1):
         numeric_scores = [0] * len(headers)
         text_scores = [0] * len(headers)
@@ -146,29 +137,16 @@ def find_columns(headers, sample_rows=None):
     return product_col, price_col
 
 
-def get_gspread_client():
-    raw = os.environ['GOOGLE_CREDENTIALS']
-    try:
-        creds_dict = json.loads(raw)
-    except (json.JSONDecodeError, ValueError):
-        creds_dict = json.loads(base64.b64decode(raw).decode('utf-8'))
-    scopes = [
-        'https://www.googleapis.com/auth/spreadsheets',
-        'https://www.googleapis.com/auth/drive'
-    ]
-    return gspread.service_account_from_dict(creds_dict, scopes=scopes)
-
-
 def update_sheet(data_rows, supplier, date_str):
     gc = get_gspread_client()
-    sheet = gc.open_by_key(SHEET_ID).sheet1
+    spreadsheet = gc.open_by_key(SHEET_ID)
+    sheet = spreadsheet.sheet1
 
     existing = sheet.get_all_values()
     if not existing or existing[0] != ['Product', 'Supplier', 'Price KRW', 'Price USD', 'Updated']:
         sheet.insert_row(['Product', 'Supplier', 'Price KRW', 'Price USD', 'Updated'], 1)
         existing = sheet.get_all_values()
 
-    # Build lookup for O(1) access instead of O(n) per product
     existing_lookup = {}
     for j, row in enumerate(existing[1:], 2):
         if len(row) >= 2:
@@ -194,40 +172,133 @@ def update_sheet(data_rows, supplier, date_str):
     if new_rows:
         sheet.append_rows(new_rows, value_input_option='RAW')
 
+    try:
+        rebuild_comparison(spreadsheet)
+    except Exception as e:
+        logger.warning(f'Comparison sheet update failed: {e}')
+
     return added, updated
 
 
-def save_to_drive(file_bytes, file_name, supplier):
-    creds = get_creds()  # google-auth creds for Drive API
-    drive = build('drive', 'v3', credentials=creds)
+def rebuild_comparison(spreadsheet):
+    sheet1 = spreadsheet.sheet1
+    all_data = sheet1.get_all_values()
 
-    query = f"name='{supplier}' and '{DRIVE_FOLDER_ID}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
-    results = drive.files().list(q=query).execute()
-    folders = results.get('files', [])
+    if len(all_data) <= 1:
+        return
 
-    if folders:
-        supplier_folder_id = folders[0]['id']
-    else:
-        meta = {
-            'name': supplier,
-            'mimeType': 'application/vnd.google-apps.folder',
-            'parents': [DRIVE_FOLDER_ID]
-        }
-        folder = drive.files().create(body=meta).execute()
-        supplier_folder_id = folder['id']
+    pivot = {}
+    suppliers_set = set()
 
-    file_meta = {'name': file_name, 'parents': [supplier_folder_id]}
-    media = MediaIoBaseUpload(
-        io.BytesIO(file_bytes),
-        mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-    )
-    drive.files().create(body=file_meta, media_body=media).execute()
+    for row in all_data[1:]:
+        if len(row) < 3 or not row[0] or not row[1]:
+            continue
+        product, supplier = row[0], row[1]
+        try:
+            price_krw = int(row[2])
+        except (ValueError, TypeError):
+            continue
+        if product not in pivot:
+            pivot[product] = {}
+        pivot[product][supplier] = price_krw
+        suppliers_set.add(supplier)
+
+    if not pivot:
+        return
+
+    suppliers = sorted(suppliers_set)
+
+    try:
+        comp = spreadsheet.worksheet('Сравнение')
+    except gspread.exceptions.WorksheetNotFound:
+        comp = spreadsheet.add_worksheet(title='Сравнение', rows=len(pivot) + 10, cols=len(suppliers) + 4)
+
+    header = ['Товар'] + suppliers + ['Лучший поставщик', 'Мин. цена ₩', 'Мин. цена $']
+    table = [header]
+
+    for product in sorted(pivot.keys()):
+        prices = pivot[product]
+        row = [product]
+        for s in suppliers:
+            row.append(prices.get(s, ''))
+        best_supplier = min(prices, key=prices.get)
+        min_krw = min(prices.values())
+        min_usd = round(min_krw / RATE, 2)
+        row.extend([best_supplier, min_krw, min_usd])
+        table.append(row)
+
+    comp.clear()
+    comp.update(table, value_input_option='RAW')
+
+
+async def handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if not text or len(text) < 2:
+        return
+
+    try:
+        gc = get_gspread_client()
+        all_data = gc.open_by_key(SHEET_ID).sheet1.get_all_values()
+    except Exception as e:
+        await update.message.reply_text(f'❌ Ошибка чтения базы: {e}')
+        return
+
+    if len(all_data) <= 1:
+        await update.message.reply_text('База пустая — сначала загрузи файлы поставщиков.')
+        return
+
+    text_lower = text.lower()
+
+    products = {}
+    for row in all_data[1:]:
+        if len(row) < 5 or not row[0] or not row[1]:
+            continue
+        product, supplier = row[0], row[1]
+        updated = row[4]
+        if text_lower not in product.lower() and text_lower not in supplier.lower():
+            continue
+        try:
+            price_krw = int(row[2])
+        except (ValueError, TypeError):
+            continue
+        if product not in products:
+            products[product] = []
+        products[product].append((supplier, price_krw, updated))
+
+    if not products:
+        await update.message.reply_text(
+            f'Ничего не найдено по запросу "{text}".\n'
+            f'Попробуй часть названия товара или поставщика.'
+        )
+        return
+
+    lines = [f'🔍 *{text}* — {len(products)} позиций\n']
+    shown = 0
+
+    for product in sorted(products.keys()):
+        if shown >= 20:
+            lines.append(f'_...и ещё {len(products) - shown} товаров. Уточни запрос._')
+            break
+        entries = sorted(products[product], key=lambda x: x[1])
+        lines.append(f'*{product}*')
+        for i, (supplier, price_krw, updated) in enumerate(entries):
+            price_usd = round(price_krw / RATE, 2)
+            mark = ' ✅' if i == 0 and len(entries) > 1 else ''
+            lines.append(f'  {supplier}: {price_krw:,}₩  (${price_usd}){mark}  _{updated}_')
+        lines.append('')
+        shown += 1
+
+    await update.message.reply_text('\n'.join(lines), parse_mode='Markdown')
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        '👋 Привет! Я помогу отслеживать цены поставщиков.\n\n'
-        'Просто кидай Excel файл — я спрошу поставщика и добавлю всё в базу.'
+        '👋 Привет!\n\n'
+        '📂 *Загрузка цен:* кидай Excel файл — спрошу поставщика и добавлю в базу.\n\n'
+        '🔍 *Поиск:* напиши название товара или поставщика — покажу цены со всех источников, '
+        'самая дешёвая отмечена ✅\n\n'
+        '📊 *Таблица сравнения* обновляется автоматически после каждой загрузки.',
+        parse_mode='Markdown'
     )
 
 
@@ -305,20 +376,12 @@ async def process_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         date_str = str(update.message.date.strftime('%Y-%m-%d'))
         added, updated_count = update_sheet(data_rows, supplier, date_str)
 
-        drive_note = ''
-        try:
-            save_to_drive(bytes(file_bytes), file_name, supplier)
-            drive_note = f'\n📁 Файл сохранён в Drive → папка {supplier}'
-        except Exception as drive_err:
-            logger.warning(f'Drive upload failed: {drive_err}')
-            drive_note = '\n⚠️ Drive: не удалось сохранить файл (нет квоты у сервисного аккаунта)'
-
         await update.message.reply_text(
             f'✅ Готово!\n\n'
             f'📦 Поставщик: {supplier}\n'
             f'➕ Добавлено: {added} товаров\n'
-            f'🔄 Обновлено: {updated_count} товаров'
-            f'{drive_note}'
+            f'🔄 Обновлено: {updated_count} товаров\n'
+            f'📊 Таблица сравнения обновлена'
         )
 
     except Exception as e:
@@ -345,6 +408,7 @@ def main():
 
     app.add_handler(CommandHandler('start', start))
     app.add_handler(conv)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_query))
 
     port = int(os.environ.get('PORT', 8080))
     webhook_url = os.environ.get('WEBHOOK_URL', '')
