@@ -309,8 +309,10 @@ async def handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text_lower = text.lower()
 
-    # Group by base name: {base_name: [(supplier, price_krw, spec, updated)]}
-    products = {}
+    # First pass: collect all matching entries and note which (supplier, price) have a spec
+    all_entries = []
+    spec_covered = set()  # (supplier, price_krw) pairs that have a spec version
+
     for row in all_data[1:]:
         if len(row) < 5 or not row[0] or not row[1]:
             continue
@@ -323,9 +325,20 @@ async def handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
             price_krw = int(row[2])
         except (ValueError, TypeError):
             continue
+        all_entries.append((base_name, supplier, price_krw, spec, updated))
+        if spec:
+            spec_covered.add((supplier, price_krw))
+
+    # Second pass: group by base name, suppressing no-spec entries superseded by spec entries
+    products = {}
+    for base_name, supplier, price_krw, spec, updated in all_entries:
+        if not spec and (supplier, price_krw) in spec_covered:
+            continue  # old entry without volume — skip, spec version exists
         if base_name not in products:
             products[base_name] = []
-        products[base_name].append((supplier, price_krw, spec, updated))
+        entry_key = (supplier, price_krw, spec)
+        if entry_key not in [( e[0], e[1], e[2]) for e in products[base_name]]:
+            products[base_name].append((supplier, price_krw, spec, updated))
 
     if not products:
         await update.message.reply_text(
@@ -342,16 +355,7 @@ async def handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f'<i>...и ещё {len(products) - shown} товаров. Уточни запрос.</i>')
             break
 
-        # Deduplicate: keep one entry per (supplier, price_krw, spec) combination
-        seen = set()
-        unique_entries = []
-        for entry in products[base_name]:
-            key = (entry[0], entry[1], entry[2])  # supplier, price, spec
-            if key not in seen:
-                seen.add(key)
-                unique_entries.append(entry)
-
-        entries = sorted(unique_entries, key=lambda x: x[1])
+        entries = sorted(products[base_name], key=lambda x: x[1])
         lines.append(f'<b>{_esc(base_name)}</b>')
         for i, (supplier, price_krw, spec, updated) in enumerate(entries):
             price_usd = round(price_krw / RATE, 2)
