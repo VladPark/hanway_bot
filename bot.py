@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ['BOT_TOKEN']
 SHEET_ID = os.environ['SHEET_ID']
+CHANNEL_ID = int(os.environ.get('CHANNEL_ID', '0'))
 RATE = 1450
 
 WAITING_SUPPLIER = 1
@@ -471,12 +472,23 @@ async def process_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         date_str = str(update.message.date.strftime('%Y-%m-%d'))
         added, updated_count = update_sheet(data_rows, supplier, date_str)
 
+        if CHANNEL_ID:
+            try:
+                await context.bot.send_document(
+                    chat_id=CHANNEL_ID,
+                    document=file_id,
+                    caption=f'📦 {supplier} | {date_str} | +{added} / ~{updated_count}'
+                )
+            except Exception as e:
+                logger.warning(f'Channel save failed: {e}')
+
         await update.message.reply_text(
             f'✅ Готово!\n\n'
             f'📦 Поставщик: {supplier}\n'
             f'➕ Добавлено: {added} товаров\n'
             f'🔄 Обновлено: {updated_count} товаров\n'
-            f'📊 Таблица сравнения обновлена'
+            f'📊 Таблица сравнения обновлена\n'
+            f'💾 Файл сохранён в архив'
         )
 
     except Exception as e:
