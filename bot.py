@@ -522,20 +522,10 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_query))
 
     port = int(os.environ.get('PORT', 8080))
-    webhook_url = os.environ.get('WEBHOOK_URL', '')
-
-    if webhook_url:
-        app.run_webhook(
-            listen='0.0.0.0',
-            port=port,
-            webhook_url=f'{webhook_url}/{BOT_TOKEN}',
-            url_path=BOT_TOKEN,
-        )
-    else:
-        health = HTTPServer(('0.0.0.0', port), HealthHandler)
-        t = threading.Thread(target=health.serve_forever, daemon=True)
-        t.start()
-        app.run_polling()
+    health = HTTPServer(('0.0.0.0', port), HealthHandler)
+    t = threading.Thread(target=health.serve_forever, daemon=True)
+    t.start()
+    app.run_polling()
 
 
 if __name__ == '__main__':
