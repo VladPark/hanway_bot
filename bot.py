@@ -35,6 +35,15 @@ NAME_KEYWORDS = [
 ]
 EXCLUDE_PRICE = ['retail', 'msrp', 'recommend', 'consumer', '소비자', '판매가', '소매']
 
+VOLUME_KEYWORDS = [
+    '용량', '내용량', 'volume', 'capacity', 'size', '사이즈', '규격', '중량',
+    'weight', 'ml', 'g(', '(g)', 'oz', 'liter'
+]
+QTY_KEYWORDS = [
+    '박스수량', '입수', 'box qty', 'pcs/box', 'qty/box', '개입', '박스당',
+    'units/box', 'pieces/box', 'ea/box', 'per box'
+]
+
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -94,6 +103,8 @@ def read_excel(file_bytes, file_name):
 def find_columns(headers, sample_rows=None):
     product_col = -1
     price_col = -1
+    volume_col = -1
+    qty_col = -1
     h_lower = [str(h).lower().strip() if h else '' for h in headers]
 
     for i, h in enumerate(h_lower):
@@ -107,6 +118,20 @@ def find_columns(headers, sample_rows=None):
         has_exclude = any(ex in h for ex in EXCLUDE_PRICE)
         if has_price and not has_exclude:
             price_col = i
+            break
+
+    for i, h in enumerate(h_lower):
+        if i in (product_col, price_col):
+            continue
+        if any(kw in h for kw in VOLUME_KEYWORDS):
+            volume_col = i
+            break
+
+    for i, h in enumerate(h_lower):
+        if i in (product_col, price_col, volume_col):
+            continue
+        if any(kw in h for kw in QTY_KEYWORDS):
+            qty_col = i
             break
 
     if sample_rows and (product_col == -1 or price_col == -1):
@@ -134,7 +159,27 @@ def find_columns(headers, sample_rows=None):
             if text_scores[best] > 0 and best != price_col:
                 product_col = best
 
-    return product_col, price_col
+    return product_col, price_col, volume_col, qty_col
+
+
+def _extract_unit_from_header(header_str):
+    h = header_str.lower()
+    for unit in ['ml', 'g', 'oz', 'kg', 'mg', 'l']:
+        if unit in h:
+            return unit
+    return ''
+
+
+def _format_spec(val, header=''):
+    s = str(val).strip()
+    if not s or s in ('0', '0.0', 'None', ''):
+        return ''
+    # Already has a unit letter — use as-is
+    if any(c.isalpha() for c in s):
+        return s
+    # Purely numeric — try to get unit from header
+    unit = _extract_unit_from_header(header)
+    return s + unit if unit else s
 
 
 def update_sheet(data_rows, supplier, date_str):
@@ -344,7 +389,7 @@ async def process_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data.clear()
             return ConversationHandler.END
 
-        product_col, price_col = find_columns(headers, all_data)
+        product_col, price_col, volume_col, qty_col = find_columns(headers, all_data)
 
         if product_col == -1 or price_col == -1:
             cols = ', '.join([str(h) for h in headers[:20] if h])
@@ -356,6 +401,9 @@ async def process_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data.clear()
             return ConversationHandler.END
 
+        vol_header = str(headers[volume_col]) if volume_col != -1 else ''
+        qty_header = str(headers[qty_col]) if qty_col != -1 else ''
+
         data_rows = []
         for row in all_data:
             if len(row) <= max(product_col, price_col):
@@ -365,8 +413,24 @@ async def process_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 price_krw = int(float(str(row[price_col] or 0).replace(',', '').replace(' ', '')))
             except Exception:
                 price_krw = 0
-            if product and price_krw > 0:
-                data_rows.append((product, price_krw))
+
+            if not product or price_krw <= 0:
+                continue
+
+            # Append volume and qty to product name if found in separate columns
+            specs = []
+            if volume_col != -1 and volume_col < len(row):
+                vol = _format_spec(row[volume_col] or '', vol_header)
+                if vol:
+                    specs.append(vol)
+            if qty_col != -1 and qty_col < len(row):
+                qty = _format_spec(row[qty_col] or '', qty_header)
+                if qty:
+                    specs.append(f'{qty}개/박스')
+            if specs:
+                product = f'{product} ({", ".join(specs)})'
+
+            data_rows.append((product, price_krw))
 
         if not data_rows:
             await update.message.reply_text('❌ Не нашёл данных в файле.')
