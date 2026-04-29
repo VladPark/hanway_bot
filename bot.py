@@ -276,6 +276,10 @@ def rebuild_comparison(spreadsheet):
     comp.update(table, value_input_option='RAW')
 
 
+def _esc(s):
+    return str(s).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+
+
 async def handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     if not text or len(text) < 2:
@@ -317,23 +321,28 @@ async def handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    lines = [f'🔍 *{text}* — {len(products)} позиций\n']
+    lines = [f'🔍 <b>{_esc(text)}</b> — {len(products)} позиций\n']
     shown = 0
 
     for product in sorted(products.keys()):
         if shown >= 20:
-            lines.append(f'_...и ещё {len(products) - shown} товаров. Уточни запрос._')
+            lines.append(f'<i>...и ещё {len(products) - shown} товаров. Уточни запрос.</i>')
             break
         entries = sorted(products[product], key=lambda x: x[1])
-        lines.append(f'*{product}*')
+        lines.append(f'<b>{_esc(product)}</b>')
         for i, (supplier, price_krw, updated) in enumerate(entries):
             price_usd = round(price_krw / RATE, 2)
             mark = ' ✅' if i == 0 and len(entries) > 1 else ''
-            lines.append(f'  {supplier}: {price_krw:,}₩  (${price_usd}){mark}  _{updated}_')
+            lines.append(f'  {_esc(supplier)}: {price_krw:,}₩  (${price_usd}){mark}  <i>{updated}</i>')
         lines.append('')
         shown += 1
 
-    await update.message.reply_text('\n'.join(lines), parse_mode='Markdown')
+    try:
+        await update.message.reply_text('\n'.join(lines), parse_mode='HTML')
+    except Exception:
+        # Fallback: plain text without formatting
+        plain = '\n'.join(lines).replace('<b>', '').replace('</b>', '').replace('<i>', '').replace('</i>', '')
+        await update.message.reply_text(plain)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
