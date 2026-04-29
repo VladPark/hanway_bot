@@ -280,6 +280,16 @@ def _esc(s):
     return str(s).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
 
 
+def _split_spec(product_name):
+    """Split 'Product Name (spec)' into ('Product Name', 'spec').
+    Only matches ASCII parentheses at end to avoid matching Chinese （）chars."""
+    import re
+    m = re.match(r'^(.+?)\s*\(([^（）\(\)]{1,30})\)\s*$', product_name)
+    if m:
+        return m.group(1).strip(), m.group(2).strip()
+    return product_name, ''
+
+
 async def handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     if not text or len(text) < 2:
@@ -298,21 +308,23 @@ async def handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text_lower = text.lower()
 
+    # Group by base name: {base_name: [(supplier, price_krw, spec, updated)]}
     products = {}
     for row in all_data[1:]:
         if len(row) < 5 or not row[0] or not row[1]:
             continue
-        product, supplier = row[0], row[1]
+        product_raw, supplier = row[0], row[1]
         updated = row[4]
-        if text_lower not in product.lower() and text_lower not in supplier.lower():
+        base_name, spec = _split_spec(product_raw)
+        if text_lower not in product_raw.lower() and text_lower not in supplier.lower():
             continue
         try:
             price_krw = int(row[2])
         except (ValueError, TypeError):
             continue
-        if product not in products:
-            products[product] = []
-        products[product].append((supplier, price_krw, updated))
+        if base_name not in products:
+            products[base_name] = []
+        products[base_name].append((supplier, price_krw, spec, updated))
 
     if not products:
         await update.message.reply_text(
@@ -324,23 +336,33 @@ async def handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = [f'🔍 <b>{_esc(text)}</b> — {len(products)} позиций\n']
     shown = 0
 
-    for product in sorted(products.keys()):
+    for base_name in sorted(products.keys()):
         if shown >= 20:
             lines.append(f'<i>...и ещё {len(products) - shown} товаров. Уточни запрос.</i>')
             break
-        entries = sorted(products[product], key=lambda x: x[1])
-        lines.append(f'<b>{_esc(product)}</b>')
-        for i, (supplier, price_krw, updated) in enumerate(entries):
+
+        # Deduplicate: keep one entry per (supplier, price_krw, spec) combination
+        seen = set()
+        unique_entries = []
+        for entry in products[base_name]:
+            key = (entry[0], entry[1], entry[2])  # supplier, price, spec
+            if key not in seen:
+                seen.add(key)
+                unique_entries.append(entry)
+
+        entries = sorted(unique_entries, key=lambda x: x[1])
+        lines.append(f'<b>{_esc(base_name)}</b>')
+        for i, (supplier, price_krw, spec, updated) in enumerate(entries):
             price_usd = round(price_krw / RATE, 2)
             mark = ' ✅' if i == 0 and len(entries) > 1 else ''
-            lines.append(f'  {_esc(supplier)}: {price_krw:,}₩  (${price_usd}){mark}  <i>{updated}</i>')
+            spec_str = f'  <i>{_esc(spec)}</i>' if spec else ''
+            lines.append(f'  {_esc(supplier)}: {price_krw:,}₩ (${price_usd}){mark}{spec_str}')
         lines.append('')
         shown += 1
 
     try:
         await update.message.reply_text('\n'.join(lines), parse_mode='HTML')
     except Exception:
-        # Fallback: plain text without formatting
         plain = '\n'.join(lines).replace('<b>', '').replace('</b>', '').replace('<i>', '').replace('</i>', '')
         await update.message.reply_text(plain)
 
