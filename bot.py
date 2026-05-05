@@ -106,13 +106,21 @@ def find_columns(headers, sample_rows=None):
     price_col = -1
     volume_col = -1
     qty_col = -1
-    h_lower = [str(h).lower().strip() if h else '' for h in headers]
+    h_lower = [str(h).lower().strip().replace('\n', ' ').replace('\r', ' ') if h else '' for h in headers]
 
+    # First pass: prefer ENG columns over KOR (so CELIMAX ENG names take priority)
     for i, h in enumerate(h_lower):
         for kw in NAME_KEYWORDS:
-            if kw in h:
+            if kw in h and ('eng' in h or 'english' in h or '(en' in h):
                 product_col = i
                 break
+    # Second pass: fall back to any name column
+    if product_col == -1:
+        for i, h in enumerate(h_lower):
+            for kw in NAME_KEYWORDS:
+                if kw in h:
+                    product_col = i
+                    break
 
     for i, h in enumerate(h_lower):
         has_price = any(kw in h for kw in PRICE_KEYWORDS)
@@ -446,7 +454,8 @@ async def process_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 continue
             product = str(row[product_col] or '').strip()
             try:
-                price_krw = int(float(str(row[price_col] or 0).replace(',', '').replace(' ', '')))
+                price_str = str(row[price_col] or 0).replace(',', '').replace(' ', '').replace('$', '').replace('₩', '').replace('¥', '').replace('₺', '').strip()
+                price_krw = int(float(price_str))
             except Exception:
                 price_krw = 0
 
