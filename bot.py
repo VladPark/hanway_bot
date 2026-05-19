@@ -4,6 +4,7 @@ import logging
 import io
 import base64
 import threading
+import re
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from telegram import Update
@@ -24,6 +25,9 @@ CHANNEL_ID = int(os.environ.get('CHANNEL_ID', '0'))
 RATE = 1450
 
 WAITING_SUPPLIER = 1
+
+# Sheet schema: ['Дата', 'Поставщик', 'Товар', 'Цена KRW', 'Цена USD']
+HEADER = ['Дата', 'Поставщик', 'Товар', 'Цена KRW', 'Цена USD']
 
 PRICE_KEYWORDS = [
     'supply price', 'supply', '공급가', '납품가', '공급단가', '공급가격',
@@ -69,6 +73,40 @@ def get_gspread_client():
     return gspread.service_account_from_dict(creds_dict, scopes=scopes)
 
 
+def get_base_sheet(spreadsheet):
+    """Get or create 'База' sheet. Migrates old format automatically."""
+    sheet = None
+    try:
+        sheet = spreadsheet.worksheet('База')
+    except gspread.exceptions.WorksheetNotFound:
+        sheet = spreadsheet.sheet1
+        try:
+            sheet.update_title('База')
+        except Exception:
+            pass
+
+    existing = sheet.get_all_values()
+
+    # Migrate old format: ['Product', 'Supplier', 'Price KRW', 'Price USD', 'Updated']
+    if existing and existing[0] == ['Product', 'Supplier', 'Price KRW', 'Price USD', 'Updated']:
+        logger.info('Migrating sheet to new format...')
+        new_data = [HEADER]
+        for row in existing[1:]:
+            if len(row) >= 5 and row[0] and row[2]:
+                # old: product, supplier, price_krw, price_usd, date
+                new_data.append([row[4], row[1], row[0], row[2], row[3]])
+        sheet.clear()
+        if len(new_data) > 1:
+            sheet.update(new_data, value_input_option='RAW')
+        else:
+            sheet.append_row(HEADER)
+    elif not existing or existing[0] != HEADER:
+        sheet.clear()
+        sheet.append_row(HEADER)
+
+    return sheet
+
+
 def read_excel(file_bytes, file_name):
     ext = file_name.lower().rsplit('.', 1)[-1]
 
@@ -80,10 +118,10 @@ def read_excel(file_bytes, file_name):
     else:
         wb = openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
         best_ws = wb.active
-        for sheet in wb.worksheets:
-            if sheet.max_row and sheet.max_column:
-                if not best_ws.max_row or (sheet.max_row * sheet.max_column > best_ws.max_row * best_ws.max_column):
-                    best_ws = sheet
+        for s in wb.worksheets:
+            if s.max_row and s.max_column:
+                if not best_ws.max_row or (s.max_row * s.max_column > best_ws.max_row * best_ws.max_column):
+                    best_ws = s
         all_rows = [list(row) for row in best_ws.iter_rows(values_only=True)]
         wb.close()
 
@@ -96,25 +134,21 @@ def read_excel(file_bytes, file_name):
             header_idx = i
             break
 
-    headers = all_rows[header_idx]
-    data = all_rows[header_idx + 1:]
-    return headers, data
+    return all_rows[header_idx], all_rows[header_idx + 1:]
 
 
 def find_columns(headers, sample_rows=None):
-    product_col = -1
-    price_col = -1
-    volume_col = -1
-    qty_col = -1
+    product_col = price_col = volume_col = qty_col = -1
     h_lower = [str(h).lower().strip().replace('\n', ' ').replace('\r', ' ') if h else '' for h in headers]
 
-    # First pass: prefer ENG columns over KOR (so CELIMAX ENG names take priority)
+    # First pass: prefer ENG product columns
     for i, h in enumerate(h_lower):
         for kw in NAME_KEYWORDS:
             if kw in h and ('eng' in h or 'english' in h or '(en' in h):
                 product_col = i
                 break
-    # Second pass: fall back to any name column
+
+    # Second pass: any name column
     if product_col == -1:
         for i, h in enumerate(h_lower):
             for kw in NAME_KEYWORDS:
@@ -183,78 +217,73 @@ def _format_spec(val, header=''):
     s = str(val).strip()
     if not s or s in ('0', '0.0', 'None', ''):
         return ''
-    # Already has a unit letter — use as-is
     if any(c.isalpha() for c in s):
         return s
-    # Purely numeric — try to get unit from header
     unit = _extract_unit_from_header(header)
     return s + unit if unit else s
 
 
-def update_sheet(data_rows, supplier, date_str):
-    gc = get_gspread_client()
-    spreadsheet = gc.open_by_key(SHEET_ID)
-    sheet = spreadsheet.sheet1
+def get_latest_prices(all_data):
+    """
+    From append-only history, return the most recent price per (product, supplier).
+    Returns: dict  (product, supplier) -> (date_str, price_krw)
+    """
+    latest = {}
+    for row in all_data[1:]:           # skip header
+        if len(row) < 4:
+            continue
+        date, supplier, product, price_raw = row[0], row[1], row[2], row[3]
+        if not product or not supplier or not price_raw:
+            continue
+        try:
+            price_krw = int(float(str(price_raw).replace(',', '')))
+        except (ValueError, TypeError):
+            continue
+        if price_krw <= 0:
+            continue
+        key = (product, supplier)
+        # Date is YYYY-MM-DD — string comparison works correctly
+        if key not in latest or date > latest[key][0]:
+            latest[key] = (date, price_krw)
+    return latest
 
-    existing = sheet.get_all_values()
-    if not existing or existing[0] != ['Product', 'Supplier', 'Price KRW', 'Price USD', 'Updated']:
-        sheet.insert_row(['Product', 'Supplier', 'Price KRW', 'Price USD', 'Updated'], 1)
-        existing = sheet.get_all_values()
 
-    existing_lookup = {}
-    for j, row in enumerate(existing[1:], 2):
-        if len(row) >= 2:
-            existing_lookup[(row[0], row[1])] = j
+def update_sheet(data_rows, supplier, date_str, spreadsheet):
+    """Append new price rows to history. Never overwrites existing data."""
+    sheet = get_base_sheet(spreadsheet)
 
-    batch_updates = []
-    new_rows = []
-    added = 0
-    updated = 0
-
-    for product, price_krw in data_rows:
-        price_usd = round(price_krw / RATE, 2)
-        j = existing_lookup.get((product, supplier))
-        if j:
-            batch_updates.append({'range': f'C{j}:E{j}', 'values': [[price_krw, price_usd, date_str]]})
-            updated += 1
-        else:
-            new_rows.append([product, supplier, price_krw, price_usd, date_str])
-            added += 1
-
-    if batch_updates:
-        sheet.batch_update(batch_updates)
-    if new_rows:
-        sheet.append_rows(new_rows, value_input_option='RAW')
+    new_rows = [
+        [date_str, supplier, product, price_krw, round(price_krw / RATE, 2)]
+        for product, price_krw in data_rows
+    ]
+    sheet.append_rows(new_rows, value_input_option='RAW')
 
     try:
         rebuild_comparison(spreadsheet)
     except Exception as e:
-        logger.warning(f'Comparison sheet update failed: {e}')
+        logger.warning('Comparison rebuild failed: %s', e)
 
-    return added, updated
+    return len(new_rows)
 
 
 def rebuild_comparison(spreadsheet):
-    sheet1 = spreadsheet.sheet1
-    all_data = sheet1.get_all_values()
+    """Rebuild 'Сравнение' pivot sheet from latest prices."""
+    try:
+        base_sheet = spreadsheet.worksheet('База')
+    except Exception:
+        base_sheet = spreadsheet.sheet1
 
+    all_data = base_sheet.get_all_values()
     if len(all_data) <= 1:
         return
 
+    latest = get_latest_prices(all_data)
+
+    # pivot: product -> {supplier: price_krw}
     pivot = {}
     suppliers_set = set()
-
-    for row in all_data[1:]:
-        if len(row) < 3 or not row[0] or not row[1]:
-            continue
-        product, supplier = row[0], row[1]
-        try:
-            price_krw = int(row[2])
-        except (ValueError, TypeError):
-            continue
-        if product not in pivot:
-            pivot[product] = {}
-        pivot[product][supplier] = price_krw
+    for (product, supplier), (_, price_krw) in latest.items():
+        pivot.setdefault(product, {})[supplier] = price_krw
         suppliers_set.add(supplier)
 
     if not pivot:
@@ -265,20 +294,19 @@ def rebuild_comparison(spreadsheet):
     try:
         comp = spreadsheet.worksheet('Сравнение')
     except gspread.exceptions.WorksheetNotFound:
-        comp = spreadsheet.add_worksheet(title='Сравнение', rows=len(pivot) + 10, cols=len(suppliers) + 4)
+        comp = spreadsheet.add_worksheet(
+            title='Сравнение', rows=len(pivot) + 10, cols=len(suppliers) + 4
+        )
 
     header = ['Товар'] + suppliers + ['Лучший поставщик', 'Мин. цена ₩', 'Мин. цена $']
     table = [header]
 
     for product in sorted(pivot.keys()):
         prices = pivot[product]
-        row = [product]
-        for s in suppliers:
-            row.append(prices.get(s, ''))
-        best_supplier = min(prices, key=prices.get)
+        row = [product] + [prices.get(s, '') for s in suppliers]
+        best = min(prices, key=prices.get)
         min_krw = min(prices.values())
-        min_usd = round(min_krw / RATE, 2)
-        row.extend([best_supplier, min_krw, min_usd])
+        row.extend([best, min_krw, round(min_krw / RATE, 2)])
         table.append(row)
 
     comp.clear()
@@ -290,10 +318,7 @@ def _esc(s):
 
 
 def _split_spec(product_name):
-    """Split 'Product Name (spec)' into ('Product Name', 'spec').
-    Only matches ASCII parentheses at end to avoid matching Chinese （）chars."""
-    import re
-    m = re.match(r'^(.+?)\s*\(([^（）\(\)]{1,30})\)\s*$', product_name)
+    m = re.match(r'^(.+?)\s*\(([^（）()]{1,30})\)\s*$', product_name)
     if m:
         return m.group(1).strip(), m.group(2).strip()
     return product_name, ''
@@ -306,7 +331,12 @@ async def handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         gc = get_gspread_client()
-        all_data = gc.open_by_key(SHEET_ID).sheet1.get_all_values()
+        spreadsheet = gc.open_by_key(SHEET_ID)
+        try:
+            sheet = spreadsheet.worksheet('База')
+        except Exception:
+            sheet = spreadsheet.sheet1
+        all_data = sheet.get_all_values()
     except Exception as e:
         await update.message.reply_text(f'❌ Ошибка чтения базы: {e}')
         return
@@ -316,42 +346,20 @@ async def handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text_lower = text.lower()
+    latest = get_latest_prices(all_data)
 
-    # First pass: collect all matching entries and note which (supplier, price) have a spec
-    all_entries = []
-    spec_covered = set()  # (supplier, price_krw) pairs that have a spec version
-
-    for row in all_data[1:]:
-        if len(row) < 5 or not row[0] or not row[1]:
+    # Group matching entries by base product name
+    products = {}  # base_name -> [(supplier, price_krw, spec, date)]
+    for (product, supplier), (date, price_krw) in latest.items():
+        if text_lower not in product.lower() and text_lower not in supplier.lower():
             continue
-        product_raw, supplier = row[0], row[1]
-        updated = row[4]
-        base_name, spec = _split_spec(product_raw)
-        if text_lower not in product_raw.lower() and text_lower not in supplier.lower():
-            continue
-        try:
-            price_krw = int(row[2])
-        except (ValueError, TypeError):
-            continue
-        all_entries.append((base_name, supplier, price_krw, spec, updated))
-        if spec:
-            spec_covered.add((supplier, price_krw))
-
-    # Second pass: group by base name, suppressing no-spec entries superseded by spec entries
-    products = {}
-    for base_name, supplier, price_krw, spec, updated in all_entries:
-        if not spec and (supplier, price_krw) in spec_covered:
-            continue  # old entry without volume — skip, spec version exists
-        if base_name not in products:
-            products[base_name] = []
-        entry_key = (supplier, price_krw, spec)
-        if entry_key not in [( e[0], e[1], e[2]) for e in products[base_name]]:
-            products[base_name].append((supplier, price_krw, spec, updated))
+        base_name, spec = _split_spec(product)
+        products.setdefault(base_name, []).append((supplier, price_krw, spec, date))
 
     if not products:
         await update.message.reply_text(
-            f'Ничего не найдено по запросу "{text}".\n'
-            f'Попробуй часть названия товара или поставщика.'
+            f'Ничего не найдено по запросу «{_esc(text)}».\n'
+            f'Попробуй часть названия бренда, товара или поставщика.'
         )
         return
 
@@ -363,31 +371,39 @@ async def handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f'<i>...и ещё {len(products) - shown} товаров. Уточни запрос.</i>')
             break
 
+        # Sort by price ascending — cheapest first
         entries = sorted(products[base_name], key=lambda x: x[1])
         lines.append(f'<b>{_esc(base_name)}</b>')
-        for i, (supplier, price_krw, spec, updated) in enumerate(entries):
+
+        for i, (supplier, price_krw, spec, date) in enumerate(entries):
             price_usd = round(price_krw / RATE, 2)
-            mark = ' ✅' if i == 0 and len(entries) > 1 else ''
+            best_mark = ' ✅' if i == 0 else ''
             spec_str = f'  <i>{_esc(spec)}</i>' if spec else ''
-            lines.append(f'  {_esc(supplier)}: {price_krw:,}₩ (${price_usd}){mark}{spec_str}')
+            lines.append(
+                f'  🏭 {_esc(supplier)}: <b>{price_krw:,}₩</b> / ${price_usd}{best_mark}{spec_str}'
+            )
+
         lines.append('')
         shown += 1
 
     try:
         await update.message.reply_text('\n'.join(lines), parse_mode='HTML')
     except Exception:
-        plain = '\n'.join(lines).replace('<b>', '').replace('</b>', '').replace('<i>', '').replace('</i>', '')
+        plain = re.sub(r'<[^>]+>', '', '\n'.join(lines))
         await update.message.reply_text(plain)
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         '👋 Привет!\n\n'
-        '📂 *Загрузка цен:* кидай Excel файл — спрошу поставщика и добавлю в базу.\n\n'
-        '🔍 *Поиск:* напиши название товара или поставщика — покажу цены со всех источников, '
-        'самая дешёвая отмечена ✅\n\n'
-        '📊 *Таблица сравнения* обновляется автоматически после каждой загрузки.',
-        parse_mode='Markdown'
+        '📂 <b>Загрузка прайса:</b> кидай Excel файл поставщика.\n'
+        'Укажи поставщика в подписи или я спрошу.\n'
+        'Каждая загрузка <b>добавляется в историю</b> с датой — старые цены не удаляются.\n\n'
+        '🔍 <b>Поиск цен:</b> напиши название бренда или товара.\n'
+        'Покажу актуальные цены от всех поставщиков,\n'
+        'самая дешёвая отмечена <b>✅</b> с именем поставщика.\n\n'
+        '📊 Лист <b>«Сравнение»</b> в таблице обновляется автоматически.',
+        parse_mode='HTML'
     )
 
 
@@ -400,20 +416,20 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['file_id'] = doc.file_id
     context.user_data['file_name'] = doc.file_name
 
-    caption = update.message.caption
-    if caption and caption.strip():
-        context.user_data['supplier'] = caption.strip()
-        await update.message.reply_text(f'⏳ Обрабатываю файл от {caption.strip()}...')
+    caption = (update.message.caption or '').strip()
+    if caption:
+        context.user_data['supplier'] = caption
+        await update.message.reply_text(f'⏳ Обрабатываю файл от <b>{_esc(caption)}</b>...', parse_mode='HTML')
         return await process_file(update, context)
 
-    await update.message.reply_text('🏢 Кто поставщик?')
+    await update.message.reply_text('🏢 Кто поставщик? (напиши название)')
     return WAITING_SUPPLIER
 
 
 async def handle_supplier_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     supplier = update.message.text.strip()
     context.user_data['supplier'] = supplier
-    await update.message.reply_text(f'⏳ Обрабатываю файл от {supplier}...')
+    await update.message.reply_text(f'⏳ Обрабатываю файл от <b>{_esc(supplier)}</b>...', parse_mode='HTML')
     return await process_file(update, context)
 
 
@@ -423,24 +439,23 @@ async def process_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     supplier = context.user_data.get('supplier')
 
     try:
-        file = await context.bot.get_file(file_id)
-        file_bytes = await file.download_as_bytearray()
+        tg_file = await context.bot.get_file(file_id)
+        file_bytes = await tg_file.download_as_bytearray()
 
-        headers, all_data = read_excel(file_bytes, file_name)
+        headers, all_rows = read_excel(file_bytes, file_name)
 
         if not headers:
             await update.message.reply_text('❌ Файл пустой или не читается.')
             context.user_data.clear()
             return ConversationHandler.END
 
-        product_col, price_col, volume_col, qty_col = find_columns(headers, all_data)
+        product_col, price_col, volume_col, qty_col = find_columns(headers, all_rows)
 
         if product_col == -1 or price_col == -1:
-            cols = ', '.join([str(h) for h in headers[:20] if h])
+            cols = ', '.join(str(h) for h in headers[:20] if h)
             await update.message.reply_text(
                 f'❌ Не нашёл столбцы товара или цены.\n'
-                f'Столбцы в файле: {cols}\n\n'
-                f'Напиши какой столбец цена и какой название.'
+                f'Столбцы в файле: {cols}'
             )
             context.user_data.clear()
             return ConversationHandler.END
@@ -449,12 +464,17 @@ async def process_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         qty_header = str(headers[qty_col]) if qty_col != -1 else ''
 
         data_rows = []
-        for row in all_data:
+        for row in all_rows:
             if len(row) <= max(product_col, price_col):
                 continue
             product = str(row[product_col] or '').strip()
             try:
-                price_str = str(row[price_col] or 0).replace(',', '').replace(' ', '').replace('$', '').replace('₩', '').replace('¥', '').replace('₺', '').strip()
+                price_str = (
+                    str(row[price_col] or 0)
+                    .replace(',', '').replace(' ', '')
+                    .replace('$', '').replace('₩', '')
+                    .replace('¥', '').replace('₺', '').strip()
+                )
                 price_krw = int(float(price_str))
             except Exception:
                 price_krw = 0
@@ -462,7 +482,6 @@ async def process_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not product or price_krw <= 0:
                 continue
 
-            # Append volume and qty to product name if found in separate columns
             specs = []
             if volume_col != -1 and volume_col < len(row):
                 vol = _format_spec(row[volume_col] or '', vol_header)
@@ -482,33 +501,33 @@ async def process_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data.clear()
             return ConversationHandler.END
 
-        date_str = str(update.message.date.strftime('%Y-%m-%d'))
-        added, updated_count = update_sheet(data_rows, supplier, date_str)
+        date_str = update.message.date.strftime('%Y-%m-%d')
+        gc = get_gspread_client()
+        spreadsheet = gc.open_by_key(SHEET_ID)
+        added = update_sheet(data_rows, supplier, date_str, spreadsheet)
 
         if CHANNEL_ID:
             try:
                 await context.bot.send_document(
                     chat_id=CHANNEL_ID,
                     document=file_id,
-                    caption=f'📦 {supplier} | {date_str} | +{added} / ~{updated_count}'
+                    caption=f'📦 {supplier} | {date_str} | {added} позиций'
                 )
             except Exception as e:
-                logger.warning(f'Channel save failed: {e}')
+                logger.warning('Channel forward failed: %s', e)
 
         await update.message.reply_text(
-            f'✅ Готово!\n\n'
-            f'📦 Поставщик: {supplier}\n'
-            f'➕ Добавлено: {added} товаров\n'
-            f'🔄 Обновлено: {updated_count} товаров\n'
-            f'📊 Таблица сравнения обновлена\n'
-            f'💾 Файл сохранён в архив'
+            f'✅ <b>Готово!</b>\n\n'
+            f'📦 Поставщик: <b>{_esc(supplier)}</b>\n'
+            f'📅 Дата: {date_str}\n'
+            f'➕ Добавлено в историю: <b>{added}</b> позиций\n'
+            f'📊 Таблица сравнения обновлена',
+            parse_mode='HTML'
         )
 
     except Exception as e:
-        logger.error(e, exc_info=True)
-        err = str(e) if str(e) else type(e).__name__
-        if not str(e) and e.__cause__:
-            err = f"{type(e).__name__}: {str(e.__cause__)[:300]}"
+        logger.error('process_file error', exc_info=True)
+        err = str(e) or type(e).__name__
         await update.message.reply_text(f'❌ Ошибка: {err}')
 
     context.user_data.clear()
@@ -526,14 +545,15 @@ def main():
         fallbacks=[]
     )
 
-    app.add_handler(CommandHandler('start', start))
+    app.add_handler(CommandHandler('start', cmd_start))
     app.add_handler(conv)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_query))
 
     port = int(os.environ.get('PORT', 8080))
     health = HTTPServer(('0.0.0.0', port), HealthHandler)
-    t = threading.Thread(target=health.serve_forever, daemon=True)
-    t.start()
+    threading.Thread(target=health.serve_forever, daemon=True).start()
+
+    logger.info('Bot started')
     app.run_polling()
 
 
