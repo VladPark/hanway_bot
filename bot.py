@@ -27,7 +27,7 @@ SHEET_ID       = os.environ['SHEET_ID']
 CHANNEL_ID     = int(os.environ.get('CHANNEL_ID', '0'))
 DRIVE_FOLDER_ID = os.environ.get('DRIVE_FOLDER_ID', '')
 
-HEADER = ['Дата', 'Поставщик', 'Товар', 'Цена KRW', 'Цена USD']
+HEADER = ['Дата', 'Поставщик', 'Бренд', 'Товар', 'Цена KRW', 'Цена USD']
 DEFAULT_RATE = 1450
 
 # ── Conversation states ────────────────────────────────────────────────────────
@@ -35,6 +35,7 @@ WAITING_SUPPLIER  = 1
 WAITING_PRICE_COL = 2
 WAITING_NAME_COL  = 3
 WAITING_RATE      = 4
+WAITING_BRAND     = 5
 
 # ── Column detection keywords ──────────────────────────────────────────────────
 PRICE_KEYWORDS = [
@@ -46,7 +47,8 @@ NAME_KEYWORDS = [
     'product name', 'product', '상품명', '품명', '제품명', '상품',
     'item', 'name', '품목', '아이템', '모델명', '모델', '제품', '항목'
 ]
-EXCLUDE_PRICE  = ['retail', 'msrp', 'recommend', 'consumer', '소비자', '판매가', '소매']
+EXCLUDE_PRICE  = ['retail', 'msrp', 'recommend', 'consumer', '소비자', '판매가', '소매',
+                  'rate', 'ratio', '비율', '할인율', '할인', '세율', 'discount', 'margin']
 VOLUME_KEYWORDS = [
     '용량', '내용량', 'volume', 'capacity', 'size', '사이즈', '규격', '중량',
     'weight', 'ml', 'g(', '(g)', 'oz', 'liter'
@@ -144,13 +146,26 @@ def get_base_sheet(spreadsheet):
             pass
 
     existing = sheet.get_all_values()
-    # Migrate old format
+    # Migrate very old format (Product, Supplier, Price KRW, Price USD, Updated)
     if existing and existing[0] == ['Product', 'Supplier', 'Price KRW', 'Price USD', 'Updated']:
-        logger.info('Migrating old sheet format...')
+        logger.info('Migrating very old sheet format...')
         new_data = [HEADER]
         for row in existing[1:]:
             if len(row) >= 5 and row[0] and row[2]:
-                new_data.append([row[4], row[1], row[0], row[2], row[3]])
+                new_data.append([row[4], row[1], '', row[0], row[2], row[3]])
+        sheet.clear()
+        sheet.update(new_data, value_input_option='RAW')
+    # Migrate v1 format (Дата, Поставщик, Товар, Цена KRW, Цена USD) — no Brand column
+    elif existing and existing[0] == ['Дата', 'Поставщик', 'Товар', 'Цена KRW', 'Цена USD']:
+        logger.info('Migrating v1 sheet format (adding Бренд column)...')
+        new_data = [HEADER]
+        for row in existing[1:]:
+            if len(row) >= 4:
+                new_data.append([
+                    row[0], row[1], '',
+                    row[2], row[3],
+                    row[4] if len(row) > 4 else ''
+                ])
         sheet.clear()
         sheet.update(new_data, value_input_option='RAW')
     elif not existing or existing[0] != HEADER:
@@ -160,11 +175,14 @@ def get_base_sheet(spreadsheet):
 
 
 def get_latest_prices(all_data):
-    """Most recent price per (product, supplier) from append-only history."""
+    """Most recent price per (product, supplier) from append-only history.
+    Returns: {(product, supplier): (date, price_krw, brand)}
+    """
     latest = {}
     for row in all_data[1:]:
-        if len(row) < 4: continue
-        date, supplier, product, price_raw = row[0], row[1], row[2], row[3]
+        if len(row) < 5: continue
+        # New format: [date, supplier, brand, product, price_krw, price_usd]
+        date, supplier, brand, product, price_raw = row[0], row[1], row[2], row[3], row[4]
         if not product or not supplier or not price_raw: continue
         try:
             price_krw = int(float(str(price_raw).replace(',', '')))
@@ -173,50 +191,71 @@ def get_latest_prices(all_data):
         if price_krw <= 0: continue
         key = (product, supplier)
         if key not in latest or date > latest[key][0]:
-            latest[key] = (date, price_krw)
+            latest[key] = (date, price_krw, brand)
     return latest
 
 
-def save_to_sheet(data_rows, supplier, date_str, rate, spreadsheet):
+def save_to_sheet(data_rows, supplier, brand, date_str, rate, spreadsheet):
     sheet = get_base_sheet(spreadsheet)
     new_rows = [
-        [date_str, supplier, product, price_krw, round(price_krw / rate, 2)]
+        [date_str, supplier, brand, product, price_krw, round(price_krw / rate, 2)]
         for product, price_krw in data_rows
     ]
     sheet.append_rows(new_rows, value_input_option='RAW')
-    try:
-        rebuild_comparison(spreadsheet, rate)
-    except Exception as e:
-        logger.warning('Comparison rebuild failed: %s', e)
+    for fn_name, fn_args in [
+        ('rebuild_comparison',     (spreadsheet, rate)),
+        ('rebuild_best_prices',    (spreadsheet, rate)),
+        ('rebuild_brand_catalog',  (spreadsheet,)),
+        ('rebuild_supplier_catalog', (spreadsheet,)),
+        ('rebuild_dashboard',      (spreadsheet,)),
+    ]:
+        try:
+            globals()[fn_name](*fn_args)
+        except Exception as e:
+            logger.warning('%s failed: %s', fn_name, e)
     return len(new_rows)
 
 
-def rebuild_comparison(spreadsheet, rate=DEFAULT_RATE):
+def _get_or_create_sheet(spreadsheet, title, rows=100, cols=20):
+    try:
+        return spreadsheet.worksheet(title)
+    except gspread.exceptions.WorksheetNotFound:
+        return spreadsheet.add_worksheet(title, rows=rows, cols=cols)
+
+
+def _load_latest(spreadsheet):
     try:
         base = spreadsheet.worksheet('База')
     except Exception:
         base = spreadsheet.sheet1
     all_data = base.get_all_values()
     if len(all_data) <= 1:
+        return None, all_data
+    return get_latest_prices(all_data), all_data
+
+
+def rebuild_comparison(spreadsheet, rate=DEFAULT_RATE):
+    latest, all_data = _load_latest(spreadsheet)
+    if not latest:
         return
-    latest = get_latest_prices(all_data)
     pivot = {}
     suppliers_set = set()
-    for (product, supplier), (_, price_krw) in latest.items():
+    brands_map = {}  # product → brand
+    for (product, supplier), (_, price_krw, brand) in latest.items():
         pivot.setdefault(product, {})[supplier] = price_krw
         suppliers_set.add(supplier)
+        if brand:
+            brands_map[product] = brand
     if not pivot:
         return
     suppliers = sorted(suppliers_set)
-    try:
-        comp = spreadsheet.worksheet('Сравнение')
-    except gspread.exceptions.WorksheetNotFound:
-        comp = spreadsheet.add_worksheet('Сравнение', rows=len(pivot)+10, cols=len(suppliers)+4)
-    header = ['Товар'] + suppliers + ['Лучший поставщик', 'Мин. цена ₩', 'Мин. цена $']
+    comp = _get_or_create_sheet(spreadsheet, 'Сравнение', rows=len(pivot)+10, cols=len(suppliers)+5)
+    header = ['Бренд', 'Товар'] + suppliers + ['Лучший поставщик', 'Мин. цена ₩', 'Мин. цена $']
     table = [header]
     for product in sorted(pivot.keys()):
         prices = pivot[product]
-        row = [product] + [prices.get(s, '') for s in suppliers]
+        brand = brands_map.get(product, '')
+        row = [brand, product] + [prices.get(s, '') for s in suppliers]
         best = min(prices, key=prices.get)
         min_krw = min(prices.values())
         row.extend([best, min_krw, round(min_krw / rate, 2)])
@@ -225,7 +264,158 @@ def rebuild_comparison(spreadsheet, rate=DEFAULT_RATE):
     comp.update(table, value_input_option='RAW')
 
 
+def rebuild_best_prices(spreadsheet, rate=DEFAULT_RATE):
+    latest, _ = _load_latest(spreadsheet)
+    if not latest:
+        return
+    # Group by product: find min price across all suppliers
+    by_product = {}
+    for (product, supplier), (date, price_krw, brand) in latest.items():
+        entry = by_product.get(product)
+        if entry is None or price_krw < entry['min_krw']:
+            by_product[product] = {
+                'brand': brand, 'min_krw': price_krw,
+                'best_supplier': supplier, 'date': date,
+            }
+        # track all suppliers for this product
+        by_product[product].setdefault('all_suppliers', {})
+        by_product[product]['all_suppliers'][supplier] = price_krw
+
+    sheet = _get_or_create_sheet(spreadsheet, 'Лучшие цены', rows=len(by_product)+10, cols=8)
+    header = ['Бренд', 'Товар', 'Лучший поставщик', 'Мин. цена ₩', 'Мин. цена $', 'Дата', 'Все поставщики (цена ₩)']
+    table = [header]
+    for product in sorted(by_product.keys(), key=lambda p: (by_product[p].get('brand',''), p)):
+        d = by_product[product]
+        others = ', '.join(
+            f"{s}: {p:,}₩"
+            for s, p in sorted(d['all_suppliers'].items(), key=lambda x: x[1])
+        )
+        table.append([
+            d['brand'], product, d['best_supplier'],
+            d['min_krw'], round(d['min_krw'] / rate, 2),
+            d['date'], others
+        ])
+    sheet.clear()
+    sheet.update(table, value_input_option='RAW')
+
+
+def rebuild_brand_catalog(spreadsheet):
+    latest, _ = _load_latest(spreadsheet)
+    if not latest:
+        return
+    brands = {}  # brand → {suppliers, products, prices}
+    for (product, supplier), (date, price_krw, brand) in latest.items():
+        key = brand if brand else '(без бренда)'
+        b = brands.setdefault(key, {'suppliers': set(), 'products': set(), 'prices': []})
+        b['suppliers'].add(supplier)
+        b['products'].add(product)
+        b['prices'].append(price_krw)
+
+    sheet = _get_or_create_sheet(spreadsheet, 'Бренды', rows=len(brands)+10, cols=6)
+    header = ['Бренд', 'Поставщики', 'Кол-во товаров', 'Мин. цена ₩', 'Макс. цена ₩', 'Ср. цена ₩']
+    table = [header]
+    for brand_name in sorted(brands.keys()):
+        b = brands[brand_name]
+        prices = b['prices']
+        table.append([
+            brand_name,
+            ', '.join(sorted(b['suppliers'])),
+            len(b['products']),
+            min(prices),
+            max(prices),
+            round(sum(prices) / len(prices))
+        ])
+    sheet.clear()
+    sheet.update(table, value_input_option='RAW')
+
+
+def rebuild_supplier_catalog(spreadsheet):
+    latest, _ = _load_latest(spreadsheet)
+    if not latest:
+        return
+    suppliers = {}  # supplier → {brands, products, last_date}
+    for (product, supplier), (date, price_krw, brand) in latest.items():
+        s = suppliers.setdefault(supplier, {'brands': set(), 'products': set(), 'last_date': ''})
+        s['products'].add(product)
+        if brand:
+            s['brands'].add(brand)
+        if date > s['last_date']:
+            s['last_date'] = date
+
+    sheet = _get_or_create_sheet(spreadsheet, 'Поставщики', rows=len(suppliers)+10, cols=5)
+    header = ['Поставщик', 'Бренды', 'Кол-во товаров', 'Последнее обновление']
+    table = [header]
+    for supplier_name in sorted(suppliers.keys()):
+        s = suppliers[supplier_name]
+        table.append([
+            supplier_name,
+            ', '.join(sorted(s['brands'])) or '—',
+            len(s['products']),
+            s['last_date']
+        ])
+    sheet.clear()
+    sheet.update(table, value_input_option='RAW')
+
+
+def rebuild_dashboard(spreadsheet):
+    latest, all_data = _load_latest(spreadsheet)
+    if latest is None:
+        latest = {}
+
+    suppliers = set()
+    brands = set()
+    products = set()
+    last_date = ''
+    for (product, supplier), (date, price_krw, brand) in latest.items():
+        suppliers.add(supplier)
+        products.add(product)
+        if brand:
+            brands.add(brand)
+        if date > last_date:
+            last_date = date
+
+    total_records = max(0, len(all_data) - 1)
+
+    sheet = _get_or_create_sheet(spreadsheet, 'Дашборд', rows=15, cols=3)
+    table = [
+        ['📊 HANWAY TRADE — База прайсов', '', ''],
+        ['', '', ''],
+        ['Показатель', 'Значение', ''],
+        ['Поставщиков', len(suppliers), ''],
+        ['Брендов', len(brands), ''],
+        ['Уникальных товаров', len(products), ''],
+        ['Записей в истории', total_records, ''],
+        ['Последнее обновление', last_date or '—', ''],
+    ]
+    sheet.clear()
+    sheet.update(table, value_input_option='RAW')
+
+
 # ── Excel reading ──────────────────────────────────────────────────────────────
+def _find_header_idx(all_rows):
+    """Find the most likely header row index (0-based) in the first 25 rows."""
+    all_kw = PRICE_KEYWORDS + NAME_KEYWORDS + VOLUME_KEYWORDS + QTY_KEYWORDS
+    best_score = -1
+    best_idx = 0
+    for i, row in enumerate(all_rows[:25]):
+        non_empty = sum(1 for v in row if v is not None and str(v).strip())
+        if non_empty < 2:
+            continue
+        h_lower = [str(h).lower().strip().replace('\n', ' ') if h else '' for h in row]
+        score = sum(1 for h in h_lower if any(kw in h for kw in all_kw))
+        # Bonus: row has many non-empty cells = wider table
+        score += non_empty * 0.05
+        if score > best_score:
+            best_score = score
+            best_idx = i
+    # Fallback: first row with 3+ non-empty cells
+    if best_score <= 0:
+        for i, row in enumerate(all_rows[:15]):
+            if sum(1 for v in row if v is not None and str(v).strip()) >= 3:
+                return i
+    return best_idx
+
+
 def read_excel(file_bytes, file_name):
     ext = file_name.lower().rsplit('.', 1)[-1]
     if ext == 'xls':
@@ -236,19 +426,18 @@ def read_excel(file_bytes, file_name):
     else:
         wb = openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
         best_ws = wb.active
+        best_score = 0
         for s in wb.worksheets:
             if s.max_row and s.max_column:
-                if not best_ws.max_row or s.max_row * s.max_column > best_ws.max_row * best_ws.max_column:
+                score = (s.max_row or 0) * (s.max_column or 0)
+                if score > best_score:
+                    best_score = score
                     best_ws = s
         all_rows = [list(row) for row in best_ws.iter_rows(values_only=True)]
         wb.close()
     if not all_rows:
         return [], []
-    header_idx = 0
-    for i, row in enumerate(all_rows[:15]):
-        if sum(1 for v in row if v is not None and str(v).strip()) >= 3:
-            header_idx = i
-            break
+    header_idx = _find_header_idx(all_rows)
     return all_rows[header_idx], all_rows[header_idx + 1:]
 
 
@@ -267,9 +456,27 @@ def find_columns(headers, sample_rows=None):
                 if kw in h:
                     product_col = i; break
 
+    def _is_valid_price_col(col_idx, sample_rows):
+        """Return True if the column looks like it contains actual prices (not rates/ratios)."""
+        if sample_rows is None:
+            return True
+        vals = []
+        for row in sample_rows[:10]:
+            if col_idx < len(row) and row[col_idx] is not None:
+                try:
+                    v = float(str(row[col_idx]).replace(',', ''))
+                    vals.append(v)
+                except (ValueError, TypeError):
+                    pass
+        if not vals:
+            return True
+        avg = sum(vals) / len(vals)
+        return avg >= 10  # rates are 0.0-1.0, prices are 1000+ KRW
+
     for i, h in enumerate(h_lower):
         if any(kw in h for kw in PRICE_KEYWORDS) and not any(ex in h for ex in EXCLUDE_PRICE):
-            price_col = i; break
+            if _is_valid_price_col(i, sample_rows):
+                price_col = i; break
 
     for i, h in enumerate(h_lower):
         if i in (product_col, price_col): continue
@@ -342,9 +549,18 @@ async def _advance_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text('🏢 Напиши название поставщика:')
         return WAITING_SUPPLIER
 
+    # 2. Brand
+    if not ud.get('brand'):
+        await update.message.reply_text(
+            '🏷️ Напиши название <b>бренда</b> (например: CELIMAX, MEDICUBE, INKOA).\n'
+            'Если файл содержит несколько брендов — напиши основной или <code>mixed</code>.',
+            parse_mode='HTML'
+        )
+        return WAITING_BRAND
+
     headers = ud.get('headers', [])
 
-    # 2. Price column
+    # 3. Price column
     if ud.get('price_col') is None:
         keyboard, items = _col_keyboard(headers)
         ud['col_items'] = items
@@ -356,7 +572,7 @@ async def _advance_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return WAITING_PRICE_COL
 
-    # 3. Product name column
+    # 4. Product name column
     if ud.get('product_col') is None:
         keyboard, items = _col_keyboard(headers)
         ud['col_items'] = items
@@ -367,7 +583,7 @@ async def _advance_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return WAITING_NAME_COL
 
-    # 4. Exchange rate
+    # 5. Exchange rate
     if ud.get('rate') is None:
         await update.message.reply_text(
             f'💱 Курс KRW → USD?\n'
@@ -409,12 +625,18 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         '👋 Привет!\n\n'
         '📂 <b>Загрузка прайса:</b> отправь Excel файл поставщика.\n'
-        'Можно указать поставщика в подписи к файлу, или я спрошу.\n'
-        'Каждая загрузка добавляется в <b>историю с датой</b>.\n\n'
-        '🔍 <b>Поиск:</b> напиши название бренда или товара.\n'
+        'В подписи можно указать: <code>Поставщик | Бренд</code>\n'
+        'или бот спросит сам. Каждая загрузка добавляется в <b>историю с датой</b>.\n\n'
+        '🔍 <b>Поиск:</b> напиши название бренда, товара или поставщика.\n'
         'Покажу актуальные цены от всех поставщиков,\n'
         'самая дешёвая отмечена <b>✅</b>.\n\n'
-        '📊 Лист «Сравнение» обновляется автоматически.\n'
+        '📊 <b>Google Sheets листы:</b>\n'
+        '  • <b>База</b> — полная история всех прайсов\n'
+        '  • <b>Сравнение</b> — товары × поставщики\n'
+        '  • <b>Лучшие цены</b> — минимальная цена по каждому товару\n'
+        '  • <b>Бренды</b> — каталог брендов и их поставщики\n'
+        '  • <b>Поставщики</b> — каталог поставщиков и их бренды\n'
+        '  • <b>Дашборд</b> — общая статистика\n\n'
         '☁️ Файлы сохраняются в Google Drive по папкам поставщиков.',
         parse_mode='HTML'
     )
@@ -464,12 +686,15 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'rate':        None,       # always ask
     })
 
-    # Supplier from caption
+    # Supplier and brand from caption (format: "Supplier | Brand" or just "Supplier")
     caption = (update.message.caption or '').strip()
     if caption:
-        context.user_data['supplier'] = caption
+        parts = [p.strip() for p in caption.split('|')]
+        context.user_data['supplier'] = parts[0] if parts[0] else None
+        context.user_data['brand'] = parts[1] if len(parts) > 1 and parts[1] else None
     else:
         context.user_data['supplier'] = None
+        context.user_data['brand'] = None
 
     # Show what was detected
     det_price   = f'«{str(headers[price_col]).strip()}»'   if price_col   != -1 else '❓ не найден'
@@ -489,6 +714,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_supplier_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['supplier'] = update.message.text.strip()
+    return await _advance_flow(update, context)
+
+
+async def handle_brand_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['brand'] = update.message.text.strip()
     return await _advance_flow(update, context)
 
 
@@ -520,6 +750,7 @@ async def _do_process(update, context: ContextTypes.DEFAULT_TYPE):
     file_name   = ud['file_name']
     file_id     = ud['file_id']
     supplier    = ud['supplier']
+    brand       = ud.get('brand', '')
     headers     = ud['headers']
     all_rows    = ud['all_rows']
     product_col = ud['product_col']
@@ -534,19 +765,49 @@ async def _do_process(update, context: ContextTypes.DEFAULT_TYPE):
         vol_header = str(headers[volume_col]) if volume_col != -1 else ''
         qty_header = str(headers[qty_col])    if qty_col   != -1 else ''
 
+        def _parse_price(val):
+            if val is None:
+                return 0
+            # If already a number
+            if isinstance(val, (int, float)):
+                return int(val) if val > 0 else 0
+            s = str(val).strip()
+            # Strip all non-digit characters except period and comma
+            s = re.sub(r'[^\d.,]', '', s)
+            if not s:
+                return 0
+            # Handle European format: 12.000,50 → remove dots, replace comma with dot
+            if ',' in s and '.' in s:
+                if s.index('.') < s.index(','):
+                    s = s.replace('.', '').replace(',', '.')
+                else:
+                    s = s.replace(',', '')
+            elif ',' in s:
+                # Could be thousands separator (12,000) or decimal (12,50)
+                parts = s.split(',')
+                if len(parts) == 2 and len(parts[1]) == 3:
+                    s = s.replace(',', '')   # thousands separator
+                else:
+                    s = s.replace(',', '.')  # decimal comma
+            try:
+                return int(float(s))
+            except (ValueError, TypeError):
+                return 0
+
         data_rows = []
+        skipped_no_product = 0
+        skipped_no_price = 0
         for row in all_rows:
             if len(row) <= max(product_col, price_col): continue
             product = str(row[product_col] or '').strip()
-            try:
-                ps = (str(row[price_col] or 0)
-                      .replace(',', '').replace(' ', '')
-                      .replace('$', '').replace('₩', '')
-                      .replace('¥', '').replace('₺', '').strip())
-                price_krw = int(float(ps))
-            except Exception:
-                price_krw = 0
-            if not product or price_krw <= 0: continue
+            price_krw = _parse_price(row[price_col])
+
+            if not product:
+                skipped_no_product += 1
+                continue
+            if price_krw <= 0:
+                skipped_no_price += 1
+                continue
 
             specs = []
             if volume_col != -1 and volume_col < len(row):
@@ -560,9 +821,22 @@ async def _do_process(update, context: ContextTypes.DEFAULT_TYPE):
             data_rows.append((product, price_krw))
 
         if not data_rows:
-            await msg.edit_text('❌ Не нашёл данных в файле.')
-            context.user_data.clear()
-            return ConversationHandler.END
+            # Sample a few rows to help diagnose
+            sample = []
+            for row in all_rows[:5]:
+                if len(row) > max(product_col, price_col):
+                    sample.append(f'  товар={repr(str(row[product_col] or "")[:30])}  цена={repr(str(row[price_col] or "")[:20])}')
+            sample_text = '\n'.join(sample) if sample else '  (нет строк)'
+            await msg.edit_text(
+                f'⚠️ Не смог разобрать данные с выбранными столбцами.\n\n'
+                f'Примеры значений из первых строк:\n{sample_text}\n\n'
+                f'Выбери столбцы вручную — нажми кнопку ниже:'
+            )
+            # Reset columns so _advance_flow asks again
+            ud['price_col'] = None
+            ud['product_col'] = None
+            ud['rate'] = None
+            return await _advance_flow(update, context)
 
         date_str = update.message.date.strftime('%Y-%m-%d')
 
@@ -570,7 +844,7 @@ async def _do_process(update, context: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text('💾 Сохраняю в базу…')
         gc = get_gspread_client()
         spreadsheet = gc.open_by_key(SHEET_ID)
-        added = save_to_sheet(data_rows, supplier, date_str, rate, spreadsheet)
+        added = save_to_sheet(data_rows, supplier, brand, date_str, rate, spreadsheet)
 
         # 2. Upload to Google Drive
         await msg.edit_text('☁️ Загружаю на Drive…')
@@ -591,14 +865,16 @@ async def _do_process(update, context: ContextTypes.DEFAULT_TYPE):
         drive_line = (f'\n☁️ <a href="{drive_url}">Файл в Drive (папка {_esc(supplier)})</a>'
                       if drive_url else '\n⚠️ Drive: не загружено')
 
+        brand_line = f'\n🏷️ Бренд: <b>{_esc(brand)}</b>' if brand else ''
         await msg.edit_text(
             f'✅ <b>Готово!</b>\n\n'
-            f'📦 Поставщик: <b>{_esc(supplier)}</b>\n'
+            f'📦 Поставщик: <b>{_esc(supplier)}</b>'
+            f'{brand_line}\n'
             f'📅 Дата: {date_str}\n'
             f'💱 Курс: {rate}₩ = $1\n'
             f'➕ Добавлено в историю: <b>{added}</b> позиций\n\n'
             f'📊 <a href="{sheets_url}">Открыть таблицу базы данных</a>\n'
-            f'📊 Лист «Сравнение» обновлён'
+            f'📊 Листы обновлены: Сравнение, Лучшие цены, Бренды, Поставщики, Дашборд'
             f'{drive_line}',
             parse_mode='HTML', disable_web_page_preview=True
         )
@@ -642,11 +918,13 @@ async def handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     latest = get_latest_prices(all_data)
 
     products = {}
-    for (product, supplier), (date, price_krw) in latest.items():
-        if text_lower not in product.lower() and text_lower not in supplier.lower():
+    for (product, supplier), (date, price_krw, brand) in latest.items():
+        if (text_lower not in product.lower()
+                and text_lower not in supplier.lower()
+                and text_lower not in brand.lower()):
             continue
         base_name, spec = _split_spec(product)
-        products.setdefault(base_name, []).append((supplier, price_krw, spec, date))
+        products.setdefault(base_name, []).append((supplier, price_krw, spec, date, brand))
 
     if not products:
         await update.message.reply_text(
@@ -662,8 +940,11 @@ async def handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f'<i>...и ещё {len(products)-shown} товаров. Уточни запрос.</i>')
             break
         entries = sorted(products[base_name], key=lambda x: x[1])
-        lines.append(f'<b>{_esc(base_name)}</b>')
-        for i, (supplier, price_krw, spec, date) in enumerate(entries):
+        # brand from the cheapest entry (all should be same brand for same product)
+        brand_label = entries[0][4] if entries[0][4] else ''
+        brand_str = f' <i>({_esc(brand_label)})</i>' if brand_label else ''
+        lines.append(f'<b>{_esc(base_name)}</b>{brand_str}')
+        for i, (supplier, price_krw, spec, date, _brand) in enumerate(entries):
             price_usd = round(price_krw / DEFAULT_RATE, 2)
             mark = ' ✅' if i == 0 else ''
             spec_str = f'  <i>{_esc(spec)}</i>' if spec else ''
@@ -688,6 +969,7 @@ def main():
         entry_points=[MessageHandler(filters.Document.ALL, handle_document)],
         states={
             WAITING_SUPPLIER:  [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_supplier_input)],
+            WAITING_BRAND:     [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_brand_input)],
             WAITING_PRICE_COL: [CallbackQueryHandler(_col_callback, pattern=r'^col:')],
             WAITING_NAME_COL:  [CallbackQueryHandler(_col_callback, pattern=r'^col:')],
             WAITING_RATE:      [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_rate_input)],
