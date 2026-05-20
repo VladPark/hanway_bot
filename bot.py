@@ -587,7 +587,8 @@ async def _do_process(update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 logger.warning('Channel forward failed: %s', e)
 
-        drive_line = (f'\n☁️ <a href="{drive_url}">Открыть в Drive</a>'
+        sheets_url = f'https://docs.google.com/spreadsheets/d/{SHEET_ID}'
+        drive_line = (f'\n☁️ <a href="{drive_url}">Файл в Drive (папка {_esc(supplier)})</a>'
                       if drive_url else '\n⚠️ Drive: не загружено')
 
         await msg.edit_text(
@@ -595,8 +596,9 @@ async def _do_process(update, context: ContextTypes.DEFAULT_TYPE):
             f'📦 Поставщик: <b>{_esc(supplier)}</b>\n'
             f'📅 Дата: {date_str}\n'
             f'💱 Курс: {rate}₩ = $1\n'
-            f'➕ Добавлено в историю: <b>{added}</b> позиций\n'
-            f'📊 Таблица сравнения обновлена'
+            f'➕ Добавлено в историю: <b>{added}</b> позиций\n\n'
+            f'📊 <a href="{sheets_url}">Открыть таблицу базы данных</a>\n'
+            f'📊 Лист «Сравнение» обновлён'
             f'{drive_line}',
             parse_mode='HTML', disable_web_page_preview=True
         )
