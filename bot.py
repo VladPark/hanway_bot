@@ -7,6 +7,12 @@ import threading
 import re
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
