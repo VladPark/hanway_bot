@@ -183,12 +183,27 @@ def get_base_sheet(spreadsheet):
 def get_latest_prices(all_data):
     """Most recent price per (product, supplier) from append-only history.
     Returns: {(product, supplier): (date, price_krw, brand)}
+    Handles both formats:
+      v1 (5 cols): [Дата, Поставщик, Товар, Цена KRW, Цена USD]
+      v2 (6 cols): [Дата, Поставщик, Бренд, Товар, Цена KRW, Цена USD]
     """
     latest = {}
+    if not all_data:
+        return latest
+    # Detect format by header
+    header = all_data[0] if all_data else []
+    new_format = len(header) >= 6 and header[2] == 'Бренд'
+
     for row in all_data[1:]:
-        if len(row) < 5: continue
-        # New format: [date, supplier, brand, product, price_krw, price_usd]
-        date, supplier, brand, product, price_raw = row[0], row[1], row[2], row[3], row[4]
+        if new_format:
+            if len(row) < 5: continue
+            date, supplier, brand, product, price_raw = row[0], row[1], row[2], row[3], row[4]
+        else:
+            # Old v1 format: [date, supplier, product, price_krw, price_usd]
+            if len(row) < 4: continue
+            date, supplier, product, price_raw = row[0], row[1], row[2], row[3]
+            brand = ''
+
         if not product or not supplier or not price_raw: continue
         try:
             price_krw = int(float(str(price_raw).replace(',', '')))
